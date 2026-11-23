@@ -98,7 +98,23 @@ Expected<FlatbufferWrapper::Ptr> FlatbufferWrapper::CreateFromAllocation(
 
 这段检查在 `BuildFromAllocation()` 之前。读不同版本时，先确认它的入口是否显式调用 `VerifyFlatbuffer()`。
 
+#### 从文件入口跟到校验分支
+
+实际源码：[flatbuffer_tools.cc:332–338](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/util/flatbuffer_tools.cc#L332-L338)。
+
+```text
+CreateFromTflFile(path, allow_changes):
+    allocation = GetAllocationFromFile(path, reporter, allow_changes)
+    return CreateFromAllocation(move(allocation))
+```
+
+1. 从 `CreateFromTflFile()` 开始：`GetAllocationFromFile()` 返回可访问的字节区域，`allow_modifications` 传递给底层 I/O 策略，不是在这里修改计算图。
+2. `CreateFromAllocation()` 先检查 Allocation，再用 `base()` 和 `bytes()` 校验 FlatBuffer；这两层失败分别是文件 I/O 和无效模型，不要合成同一个错误。
+3. `BuildFromAllocation(std::move(alloc))` 成功后，模型接管 Allocation；再由 Wrapper 持有模型。这解释了后面从 Packed Model 取出的视图为什么可以继续读取。
+
 ### 2.3 验证什么、不验证什么
+
+原笔记把这里拆成两次排查：先问「文件有没有变成可读字节」，再问「这些字节能不能按 TFLite Schema 解释」。两项都通过仍不代表图能用；例如某个算子引用了不存在的 Tensor，下文要等解包时才能发现。
 
 完整 FlatBuffers Schema Verifier 的检查重点包括：
 
@@ -168,6 +184,21 @@ StoredBufferManager buffer_manager_ = std::make_unique<BufferManager>();
 
 它允许模型在不同构造情形下**自己持有**一个 `BufferManager`，或**借用外部提供的** `BufferManager`。`std::variant` 区分的是所有权形态，不是复制了两份 Buffer 内容。
 
+#### 把模型和子图里的两层循环连起来
+
+实际源码：[model_load.cc:612–624](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L612-L624)。
+
+```text
+for each serialized_subgraph in packed_model:
+    require serialized_subgraph != null
+    destination = ir_model.EmplaceSubgraph()
+    propagate UnpackSubgraph(context, serialized_subgraph, destination)
+```
+
+1. 外层每读到一个文件子图，就用 `EmplaceSubgraph()` 建一个 IR 子图，再传给 `UnpackSubgraph()`。这里还没有创建 Interpreter。
+2. 进入 `UnpackSubgraph()` 后，才运行下一节的两遍 Tensor 循环。先创建对象、再填属性，让 `UnpackTensor()` 能引用编号更靠后的 Tensor；找到对象不等于其属性已经填完。
+3. 接下来的算子解包才把这些 Tensor 接成图；子图的对外 I/O 列表另有一轮，不依赖扫描算子的连线。
+
 ### 3.2 解包一个 Subgraph
 
 对每个 Packed Subgraph，Loader 创建一个 `LiteRtSubgraphT`，然后调用 `UnpackSubgraph()`。
@@ -191,12 +222,10 @@ for (size_t i = 0; i < packed_model->subgraphs()->size(); ++i) {
 const auto num_tensors =
     tfl_subgraph.tensors() ? tfl_subgraph.tensors()->size() : 0;
 
-// 第一次循环：创建所有 Tensor 对象
 for (auto i = 0; i < num_tensors; ++i) {
   litert_subgraph.EmplaceTensor();
 }
 
-// 第二次循环：逐个解析、填充已存在的 Tensor
 for (auto i = 0; i < num_tensors; ++i) {
   const auto* tfl_tensor = tfl_subgraph.tensors()->Get(i);
   auto& litert_tensor = litert_subgraph.Tensor(i);
@@ -287,6 +316,26 @@ if (buffer_ind != 0) {
 - `should_append`：用于保留“原始字节来自追加区域”的序列化语义，并非要求当前立刻执行文件追加。
 - `LiteRT BufferId`：是 `BufferManager` 内部的句柄，**不要求与原始 TFLite Buffer 索引相等**。
 
+#### `ReadBuffer()` 怎样选中字节来源
+
+实际源码：[model_load.cc:285–312](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L285-L312)。
+
+```text
+buffer = 查模型级 Buffer 表，找不到则返回错误
+if buffer.offset != 0:
+    验证 [offset, offset + size) 落在整个 Allocation 里
+    return 追加区的非拥有字节视图，标记为应追加
+if buffer.data 存在:
+    return data 向量内的非拥有字节视图，不标记追加
+return 空视图
+```
+
+1. `GetTflBuffer()` 先用文件下标定位 `Buffer`。非零 `offset` 优先，`IsRangeInAllocation()` 检查模型 Allocation 的范围后才能按偏移取字节。
+2. 没有追加偏移时才看 `data()`；如果两个来源都没有，返回空的 Buffer 上下文。两条路径都不打开独立的权重文件。
+3. 回到上面的调用方后，同一个文件下标可以复用同一个 IR Buffer ID；`should_append` 保留的是序列化布局，不是复制字节的命令。
+
+读 `offset` 时，可以先画出两个边界：FlatBuffer 主体的末尾，以及**整个模型文件**的末尾。权重可以在前一个边界之后，只要不越过后一个边界。这正是「文件里的追加区」和下面「独立权重文件」的区别。
+
 ### 4.3 途径 B：`Tensor.external_buffer != 0`
 
 当普通 `Tensor.buffer` 不使用且 `external_buffer` 提供有效引用时，Loader 查找独立外部权重描述：
@@ -306,6 +355,12 @@ SetWeightsFromUnownedBuffer(
 ```
 
 这里保存的是外部权重的 **ID / Group / Offset / Length / Packing 等元数据**；传入的 `BufferRef` 为空，说明这段模型加载代码没有立即获取独立权重文件中的有效数据指针。这是 `UnpackTensor()` **这一阶段**的行为。较新的文件入口（[外部权重组加载变更](https://github.com/google-ai-edge/LiteRT/commit/a420b1bbfddea3d0681c0b3a9afa3e3d3e43e04b)）在 `UnpackModel()` 之后还会尝试打开权重组文件：组名为相对路径时相对模型目录解析；同组只尝试打开一次，可读时检查权重范围并将对应字节放入拥有数据的 Buffer；不可读时保留空视图，仍可由运行时选项提供权重源。这个补充属于文件入口，不应外推到所有内存加载入口。
+
+#### 用两张 Tensor 共用一份权重把 ID 对上
+
+比如 T1 和 T5 的 `Tensor.buffer` 都是 7。第一次解析时查文件 `Model.buffers[7]`，借用其字节并登记一个内部 ID，例如 12；第二次查到映射就让 T5 也使用 12。这里同时出现三类编号：T1/T5 是**子图内 Tensor** 的下标，7 是**文件级 Buffer** 下标，12 是 **BufferManager** 的内部句柄。
+
+若文件把 7 放在 `Tensor.external_buffer` 而不是 `Tensor.buffer`，查的是外部权重引用，按另一张表去重。该分支先保留 group、offset、length 和 packing，并不把外部文件字节当作内嵌常量立即读进来。这样就能把「加载得到权重引用」和「后续解析或绑定了权重字节」区分开。
 
 ### 4.4 Buffer 所有权与生命周期
 
@@ -382,7 +437,6 @@ litert_tensor.SetQarams(
 
 ```cpp
 #if !defined(LITERT_NO_BUILTIN_OPS)
-  // 解包 Operator
 #endif
 ```
 
@@ -403,7 +457,6 @@ litert_tensor.SetQarams(
 关键字段可以按用途归纳为：
 
 ```cpp
-// 概念摘录：省略其他成员
 OwningBufferRef<uint8_t> custom_options_;
 std::vector<LiteRtTensor> inputs_;
 std::vector<LiteRtTensor> outputs_;
@@ -461,13 +514,30 @@ T1 ──input──▶ Op0
 
 `T2` 的 Defining Op 是 `Op0`，而 `Op1` 是 `T2` 的使用者。一个 Tensor 可以被多个 Op 使用，但在普通 SSA 风格图结构中通常应有明确的生产者。
 
+#### 顺着 `UnpackOp()` 看一条输入边
+
+实际源码：[model_load.cc:207–234](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L207-L234)。
+
+```text
+for id in serialized_op.inputs:
+    if id == -1: continue
+    require id 在子图 Tensor 表范围内
+    把表中该 Tensor 接到当前 Op 的输入端，并登记消费者
+for id in serialized_op.outputs:
+    require id 在子图 Tensor 表范围内
+    把表中该 Tensor 接到当前 Op 的输出端，并登记生产者
+```
+
+1. 沿文件中的输入列表逐项取下标。可选输入的 `-1` 先跳过，不按负数索引访问 Tensor 表。
+2. 其他负值和越界属于无效模型。合法下标才取当前子图的 Tensor 并交给 `AttachInput()`，形成 Op 到 Tensor 的输入关联及 Tensor 到消费者的反向关系。
+3. 输出方向见同函数紧接的循环：用 `AttachOutput()` 建生产者关系。不要用这个函数来寻找整个子图的对外输入。
+
 ### 5.5 解析 Custom Options 与 Builtin Options
 
 **Custom Options：**
 
 ```cpp
 if (tfl_op.large_custom_options_size() != 0) {
-  // 当前路径记录 Warning
 }
 const auto* custom_opts = tfl_op.custom_options();
 if (custom_opts) {
@@ -508,7 +578,7 @@ litert_subgraph.Outputs().push_back(
     &litert_subgraph.Tensor(tfl_output_ind));
 ```
 
-这一步负责的是 **Subgraph 对外边界**，而不是 Operator 之间的边。因此，`AttachInput/AttachOutput` 和 `Subgraph.Inputs()/Outputs()` 虽名字相似，职责不同。
+这一步负责的是 **Subgraph 对外边界**，而不是 Operator 之间的边。因此，`AttachInput/AttachOutput` 和 `Subgraph.Inputs()/Outputs()` 虽名字相似，职责不同。这里存的是 IR 对象引用；[第三篇的 Interpreter I/O](03-interpreter-builder.md#inputs--outputs-是怎样填进去的) 读同样的文件字段，但保存的是整数索引。
 
 ---
 
@@ -524,6 +594,25 @@ litert_subgraph.Outputs().push_back(
 - **`operator_codes`**：条件编译允许时保存算子类型目录。
 
 其中部分对象先调用 FlatBuffers 生成的 `UnPack()`，再转为 LiteRT 的内部表示。不能把这些信息都概括为“简单读取，无额外处理”，例如 Signature 解包还包含索引与数量校验。
+
+原稿把 Signature 单列出来很有用，因为它和逐算子解包不一样：先核对目标子图及 I/O 数量，再用每项的 Tensor 编号处理别名，最后按子图 I/O 顺序组织列表。比如文件子图的输入是 `[T3,T7]`，具名记录先写 `rhs → T7`、再写 `lhs → T3`，整理后的名字顺序仍是 `[lhs,rhs]`。一个入口由 key 找到对应子图；参数名是入口的名字，既不是张量编号，也不是文件向量恰好出现的位置。对照无显式签名时的默认入口，见 [UnpackSignatures 与 fallback](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L518-L646)。
+
+#### 按子图顺序整理 Signature 的别名
+
+实际源码：[model_load.cc:574–597](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L574-L597)。
+
+```text
+先按文件中的 Tensor 编号建立 张量 → 别名 的映射
+for each role in [input, output]:
+    for tensor in 子图公开列表[role]:
+        追加已有张量引用
+        追加别名；没有别名时用张量本身名称
+在同一个 Signature 中保存这些有序列表以及子图与 signature key
+```
+
+1. 前面先根据 Signature 的 Tensor 索引在所属子图定位对象，建立 `Tensor → 名称` 的表。
+2. 输出和输入各自按子图原来的 I/O 顺序遍历，给每个对象查别名，找不到就用 Tensor 自身名称。序列化的具名映射不必和子图 I/O 使用相同的顺序。
+3. 最终一项名称对应同位置的 Tensor 引用，不会多造一份 Tensor 或分配输入输出数据。
 
 ### 6.2 Dispatch Op 是什么
 
@@ -572,6 +661,26 @@ struct DispatchOpOptions {
 **重要区分：**`RegisterNonOwnedBuffer` 是为 IR 注册对 Bytecode 的引用；`AttachAssetToOp` 是建立资产与 Op 的关联。**这一步并未执行 Bytecode，也不等于已经完成后端编译或初始化。**
 
 原始代码通过 `bytecode_offset` 作为查重 Key；这一选择有利于对相同位置的资产复用，但在推理其普遍正确性时，应注意它依赖序列化约定和范围检查。
+
+#### Dispatch Op 怎样找到已有的 Bytecode
+
+实际源码：[model_load.cc:742–761](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L742-L761)。
+
+```text
+for dispatch in 已识别的 Dispatch Op:
+    offset, size, entry = 读取选项
+    if offset 未登记:
+        检查该范围没有越过 Allocation
+        bytes = 借用模型中 [offset, offset + size) 的字节
+        把 BufferManager 登记的 ID 记入 offset → ID 表
+    为 dispatch 挂上表中的 ID 和 entry
+```
+
+1. 进入这段之前已经根据 custom code 识别了 Dispatch Op，并从其选项取出 `offset`、`size` 和名称。副本 ID 表以偏移为键，只在还没登记该偏移时进入范围检查与注册。
+2. 边界检查针对整个模型 Allocation。成功后构造 `BufferRef`，登记的是非拥有的字节视图；相同偏移的其他 Dispatch Op 复用已登记的 ID。
+3. `AttachAssetToOp()` 只挂资产与名字，不在这时执行 Bytecode。本段是所给快照的文件加载路径，不代表所有加载入口都做相同步骤。
+
+这里要注意：为什么查重键是 `bytecode_offset`，而不是 `(offset, size)`？这段代码把「同一偏移」当成「同一份资产」，因此必须依赖序列化端让引用同一偏移的记录指向同一段 Bytecode。范围检查与按偏移复用是两件事；不能仅凭这个表推断两条记录的长度已被逐一比对。
 
 ### 6.4 到此为止完成了什么
 
