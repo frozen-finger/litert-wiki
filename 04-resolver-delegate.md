@@ -1,12 +1,10 @@
-# LiteRT 源码笔记（四）：从算子注册到 Delegate 图改写
+# Interpreter 执行（一）：Resolver、Registration 与 ABS
 
-上一篇：[InterpreterBuilder 如何搭建执行图](03-interpreter-builder.md) · 下一篇：[源码跟读实验](05-reading-lab.md)
+上一篇：[Builder（三）](03c-interpreter-nodes.md) · [目录](README.md) · 下一篇：[执行（二）](04b-interpreter-prepare.md)
 
-知道模型里有一个 ABS，不等于运行时已经知道怎样求绝对值；知道环境里有 XNNPACK，也不等于 ABS 一定会交给它。本篇顺着两条线看：一条是 **Resolver 为原节点找实现**，另一条是 **Delegate 把满足条件的一部分原节点换成新的执行节点**。这里讨论的是 `tflite/` 下的 Interpreter 路径，不是直接对上一篇模型 IR 调用这些方法。节选以原稿的接口形态为主，宏、默认委托、支持条件和错误处理应以手头的 checkout 为准。
+上一主题的 Builder 把节点接到了 Registration。这一篇先看 Resolver 怎样提供实现，再以 ABS 跟完 Init、Prepare、Resize 和 Invoke。Delegate 的创建、选点和分区另在后面的主题里按发生顺序展开。
 
-逐段跟读见[第七篇：Resolver、ABS 与 XNNPACK 创建](07-resolver-kernel-source.md)和[第八篇：Prepare 与图改写](08-prepare-delegate-source.md)。
-
-## 1. 从 `OpResolver` 查到 `TfLiteRegistration`
+## 1. Resolver 查找什么
 
 | 需要回答的问题 | 对象 |
 | --- | --- |
@@ -25,22 +23,35 @@ Opaque 工厂用于不透明 C API 对象，不能仅按「是不是 Google Play
 - `may_directly_contain_user_defined_ops_` 是保守标记。查询还会考虑链上的 Resolver，不能拿它枚举模型使用的自定义节点。
 - `BuiltinOpResolver` 在 Mutable Resolver 上注册标准内建实现，也可能提供默认 Delegate 工厂。它是常见选择，不是唯一选择；应用可以显式提供更小的注册集合，或选择不附自动默认委托的 Resolver。
 
-### 从 `FindOp()` 看本地表与链式查找
+对照：[OpResolver 实现](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/api/op_resolver.cc)。
 
-实际源码：[mutable_op_resolver.cc:28–56](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/mutable_op_resolver.cc#L28-L56)。
+op_resolver是一个抽象基类，其中主要有以下的几个函数：
 
-```text
-查找 builtin 时以 (枚举, 版本) 为键，查找 custom 时以 (名称, 版本) 为键
-本地表命中 → 返回表项
-没命中 → 依注册顺序询问链上的 resolver
-直到找到实现；全未命中才返回空
+- findop 通过提供的op信息找到对应的registration，有两种，一种可以通过builin的enum code找到对应的算子实现，还有一种可以通过op的name找到算子实现
+- GetDelegateCreators 返回delegatec的创建方法，可以用来针对flatbuffer中的op创建对应的delgate
+`GetOpaqueDelegateCreators()` 面向不透明 C Delegate API；不能把它等同于某个特定发行渠道。
+- MayContainUserDefinedOps 返回是否有builtin之外的用户自定义op，目前默认返回为true，代表了可能会存在builtin之外的op但不代表一定存在
+
+还包括一些重要的属性：
+
+```cpp
+  using TfLiteDelegatePtrVector =
+      std::vector<std::unique_ptr<TfLiteDelegate, void (*)(TfLiteDelegate*)>>;
 ```
 
-1. Builtin 查 `(枚举, version)`，custom 查 `(名称, version)`。同一个算子的不同版本可以落到不同记录，不能只按名字找。
-2. 本地命中直接返回；未命中才按顺序问链上的 resolver，直到第一个有效指针。`nullptr` 表示没有实现，不是创建了一个空 Node。
-3. 这一层只回答“由谁实现”。Builder 下一步才把注册项和一个具体节点配在一起。
+代表了一系列delegate
 
-## 2. Registration 是实现表，Node 是图中的一次使用
+```cpp
+  using TfLiteDelegateCreator =
+      std::function<std::unique_ptr<TfLiteDelegate, void (*)(TfLiteDelegate*)>(
+          TfLiteContext* /*context*/)>;
+
+  using TfLiteDelegateCreators = std::vector<TfLiteDelegateCreator>;
+```
+
+delegate的创建函数
+
+## 2. Registration 与 Node 的职责
 
 ![图 4-1：Registration 与 Node：同一类实现，多次节点使用](figures/07-node-kernel.png)
 
@@ -61,7 +72,200 @@ Opaque 工厂用于不透明 C API 对象，不能仅按「是不是 Google Play
 
 `Subgraph::OpPrepare` 把节点交给具体实现：若 external 包装引用已有内部节点，则调用该 registration；否则优先使用带 `user_data` 的 opaque 回调，再尝试不带 data 的回调；最后可使用普通 `op_reg.prepare`。**已解析且 Prepare 为空可以成功；未解析的 Custom/Flex 占位符如果一路留到准备阶段才报错。** 这也解释了为什么构建时可能暂时接受缺少普通 CPU 实现的节点：某个 Delegate 还可能接管它。
 
-## 3. 用 ABS 跟一遍普通 CPU 内核
+`TfLiteRegistration` 是 C 风格结构体。以下保留原稿关注的回调，并用当前完整结构来讲；兼容类型 `TfLiteRegistration_V3` 不等于最新完整结构。
+
+- `init(context, buffer, length)` 为一个节点创建私有状态。Builtin 传类型化参数时长度可为 0；Custom 通常取得原始字节和长度。无状态实现可省略。
+
+- `free(context, data)` 清理由 Init 返回的私有状态，不一定等于序列化参数地址。
+
+- `prepare(context, node)` 验证参数、传播输出形状、建立临时需求；尺寸变化后可能重新 Prepare，但不是每次 Invoke 都要重做。
+
+- invoke，调用算子，参数为context和TfliteNode
+
+- profiling_string，将对应于一个TfliteNode的操作在profile总结时集成在一起
+
+- 异步内核接口可提供 `TfLiteAsyncKernel`。没有异步接口，并不代表实现无法在内部使用线程池。
+
+包含以下成员变量
+
+- builtincode
+
+- custom op name
+
+- version
+
+- registration_external TfLiteOperator，一个指向c风格对象的指针，用于提供功能给C风格的api调用者使用
+
+- inplace_operator 代表了输出向量是否可以安全覆盖输入向量
+
+`TfLiteNode` 是图中的一次算子调用，不是抽象基类。静态内存宏影响辅助 API 与部分成员，不能把桌面路径直接推到 Micro 上。
+
+```cpp
+typedef struct TfLiteNode {
+  TfLiteIntArray* inputs;
+
+  TfLiteIntArray* outputs;
+
+  TfLiteIntArray* intermediates;
+
+  TfLiteIntArray* temporaries;
+
+  void* user_data;
+
+  void* builtin_data;
+
+  const void* custom_initial_data;
+  int custom_initial_data_size;
+
+  struct TfLiteDelegate* delegate;
+
+  bool might_have_side_effect;
+} TfLiteNode;
+```
+
+主要包含了input，output以及指向delegate的指针
+
+如果要看这些回调在何时分派与续跑，接着看 [Interpreter 执行（二）](04b-interpreter-prepare.md)。
+
+## 3. MutableOpResolver 与内建注册
+
+对照：[MutableOpResolver](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/mutable_op_resolver.cc) · [BuiltinOpResolver](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/kernels/register.cc)。
+
+multableopresolver继承了opresolver，并额外添加了以下的成员
+
+- AddBuiltin, 接受builtin code，registration，以及version的方法，会替代掉对应版本范围内之前使用的registration
+
+- `AddCustom` 用名称与版本，而不是 builtin code，写入自定义注册表。
+
+- AddAll，接受mutableopresolver的指针作为参数，向本resolver添加所有指针指向的resolver中的算子
+
+- ChainOpResolver, 与addall功能类似，但是实现上只保存了指向resolver的指针，当需要时链式查找保存的指针指向的resolver有没有适合的算子，所以如果原本resolver中已有了对应算子的注册则不会查找到传入的resolver
+
+- builtins, 保存opcode到registration的映射
+
+- custom_ops_, 间接保存了custom op的name到registration映射
+
+- may_directly_contain_user_defined_ops_，代表了当前的resolver是否已经包含了用户自定义的op
+
+介绍完了额外内容，现在来看关键函数的实现, 由于有些函数功能相同只是参数不太一样不做特别区别与说明：
+
+```cpp
+const TfLiteRegistration* MutableOpResolver::FindOp(tflite::BuiltinOperator op,
+                                                    int version) const {
+  auto it = builtins_.find(std::make_pair(op, version));
+  if (it != builtins_.end()) {
+    return &it->second;
+  }
+  for (const OpResolver* other : other_op_resolvers_) {
+    const TfLiteRegistration* result = other->FindOp(op, version);
+    if (result != nullptr) {
+      return result;
+    }
+  }
+  return nullptr;
+}
+```
+
+findop从builtins按照opcode和version直接查找有没有对应的registration，如果没有再从chainresolver接口传入的额外resolver做链式查找
+
+```cpp
+void MutableOpResolver::AddBuiltin(tflite::BuiltinOperator op,
+                                   const TfLiteRegistration* registration,
+                                   int version) {
+  if (registration == nullptr) {
+    return;
+  }
+  TfLiteRegistration new_registration = *registration;
+  new_registration.custom_name = nullptr;
+  new_registration.builtin_code = op;
+  new_registration.version = version;
+  auto op_key = std::make_pair(op, version);
+  builtins_[op_key] = new_registration;
+  may_directly_contain_user_defined_ops_ = true;
+}
+```
+
+做了一份浅拷贝后，按照code和version配置到了Builtin中
+
+```cpp
+void MutableOpResolver::AddCustom(const char* name,
+                                  const TfLiteRegistration* registration,
+                                  int version) {
+  TfLiteRegistration new_registration = *registration;
+  new_registration.builtin_code = BuiltinOperator_CUSTOM;
+  new_registration.custom_name = name;
+  new_registration.version = version;
+  auto op_key = std::make_pair(name, version);
+  custom_ops_[op_key] = new_registration;
+  may_directly_contain_user_defined_ops_ = true;
+}
+```
+
+与上者类似，只是匹配改用name而不是op code
+
+```cpp
+void MutableOpResolver::AddAll(const MutableOpResolver& other) {
+  for (const auto& other_builtin : other.builtins_) {
+    builtins_[other_builtin.first] = other_builtin.second;
+  }
+  for (const auto& other_custom_op : other.custom_ops_) {
+    custom_ops_[other_custom_op.first] = other_custom_op.second;
+  }
+  other_op_resolvers_.insert(other_op_resolvers_.begin(),
+                             other.other_op_resolvers_.begin(),
+                             other.other_op_resolvers_.end());
+}
+```
+
+除了builtin和custom正常复制外，也会复制other_op_resolver
+
+```cpp
+void MutableOpResolver::ChainOpResolver(const OpResolver* other) {
+  other_op_resolvers_.push_back(other);
+}
+
+bool MutableOpResolver::MayContainUserDefinedOps() const {
+  if (may_directly_contain_user_defined_ops_) {
+    return true;
+  }
+  for (const OpResolver* other : other_op_resolvers_) {
+    if (OpResolverInternal::MayContainUserDefinedOps(*other)) {
+      return true;
+    }
+  }
+  return false;
+}
+```
+
+在判断是否包含自定义op时也会查找otheropresolver
+
+默认注册集合常由 `BuiltinOpResolver` 提供；应用也可以直接用 `MutableOpResolver` 构建更小的集合或选择不登记默认委托。
+
+```cpp
+BuiltinOpResolver::BuiltinOpResolver() {
+  RegisterBuiltinOps();
+  delegate_creators_.push_back([](TfLiteContext* context) {
+    return tflite::MaybeCreateXNNPACKDelegate(context,
+                                              XNNPackQS8Options::default_value);
+  });
+}
+```
+
+其中register执行了所有builtin op的注册
+
+```cpp
+void BuiltinOpResolver::RegisterBuiltinOps() {
+  AddBuiltin(BuiltinOperator_ABS, Register_ABS(), /* min_version = */ 1,
+             /* max_version = */ 5);
+  AddBuiltin(BuiltinOperator_HARD_SWISH, Register_HARD_SWISH());
+  AddBuiltin(BuiltinOperator_RELU, Register_RELU(), /* min_version = */ 1,
+             /* max_version = */ 3);
+  ...
+```
+
+以ABS为例：
+
+## 4. 以 ABS 跟一次 CPU 算子
 
 源码入口：`tflite/kernels/elementwise.cc` 中的 `Register_ABS`，再追 `ElementWiseQuantizedInit` / `ElementWiseQuantizedFree`、`PrepareAbs` / `GenericPrepare` 以及 `AbsEval`。把生成回调的宏展开来看，仍是普通函数指针调用。
 
@@ -79,272 +283,356 @@ output_q = saturate(round(magnitude × input_scale / output_scale) + output_zero
 
 例如输入零点为 −3、输入 scale 为 0.25，输入编码 −11 表示 −2。输出 scale 为 0.5、输出零点为 1 时，ABS 的结果 2 对应输出编码 5。源码使用定点运算近似缩放，不在循环里逐元素做浮点除法。
 
-### 3.1 ResizeTensor：为什么没有马上分配所有输出
+对照：[ABS 的注册、Prepare 和 Invoke](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/kernels/elementwise.cc)。
 
-ABS 的 Prepare 将输入形状交给 Context 的 Resize 回调；回调通过 `impl_` 找到 Subgraph，不由 ABS 内核决定全图的内存布局。看 [ResizeTensor 回调与快路径](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L1868-L1911) 和 [ResizeTensorImpl](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L2150-L2199) 时，可以按以下顺序读：
-
-1. 快路径先要求已有数据指针且 shape 完全不变；普通定长类型还须理论字节数等于当前 `bytes`。String、Resource、Variant 的大小不由这段公式判断。命中时只在需要时换掉 dims 对象，不重分配数据。同样是 12 个元素的 `[3,4]` 与 `[2,6]` 不满足 shape 相同这一条件。
-2. 进入通用实现后，先看 allocation 类型能不能调整，再视类型计算所需字节。普通堆张量可以当场调存储；String、Resource、Variant 不走普通的元素数乘类型大小路径。
-3. 更新维度；若属于 arena 管理的读写类型，则清空旧数据指针、留待内存规划。对固定只读权重，Resize 返回错误而不是直接改原文件。
-
-### 把 ABS 的 `Prepare` 和 `Invoke` 分开看
-
-实际源码：[elementwise.cc:542–550](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/kernels/elementwise.cc#L542-L550)、[elementwise.cc:212–214](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/kernels/elementwise.cc#L212-L214)、[elementwise.cc:309–330](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/kernels/elementwise.cc#L309-L330)。
-
-```text
-ABS 注册项 → Init / Free / PrepareAbs / AbsEval
-PrepareAbs:
-    检查数据类型和量化参数；令输出形状与输入相同
-AbsEval:
-    访问当前 Node 的第 0 个输入
-    FLOAT32 / INT32 → 普通计算
-    INT8 → 量化计算
-    INT16 → 按有无量化参数选计算路径
-    其他类型 → 返回错误
+```cpp
+TfLiteRegistration* Register_ABS() {
+  static TfLiteRegistration r = {elementwise::ElementWiseQuantizedInit,
+                                 elementwise::ElementWiseQuantizedFree,
+                                 PrepareAbs, elementwise::AbsEval};
+  return &r;
+}
 ```
 
-1. `Register_ABS()` 把 Init、Free、Prepare、Invoke 放到同一注册记录；Init/Free 管节点私有状态，不是每个输出元素调用一次。
-2. `PrepareAbs` 由宏展开进 `GenericPrepare()`，完成类型和量化检查、需要时准备定点参数，最后通过 Context 让输出 shape 对齐输入。`ResizeTensor()` 调整的是运行时描述和相关内存状态，不是在这里求绝对值。
-3. `AbsEval()` 的 `GetInput(..., 0)` 是**本节点的第 0 个操作数**，和主图第 0 个对外输入不是一回事。Invoke 再根据类型走浮点、普通整数或量化路径。
+这里的四个参数即为init，free, prepare和invoke的指针，一次看一下每个方法的实现
 
-## 4. Delegate 是什么，何时创建
+```cpp
+void* ElementWiseQuantizedInit(TfLiteContext* context, const char* buffer,
+                               size_t length) {
+  return new OpData();
+}
 
-![图 4-2：Delegate：显式应用与惰性应用的时机](figures/11-delegate-control.png)
-
-*图 4-2　Delegate：显式应用与惰性应用的时机。两侧是可用的入口及触发时机，不是互斥的后端模式。注册工厂时还没有改图；首次触发的确切位置和错误处理以正文对应版本为准。*
-
-`TfLiteDelegate` 也是 C 风格结构体。它的 `Prepare(context, delegate)` 不是某个 ABS 节点的 Prepare，而是检查图、选择可接管节点、请求改写执行计划。它可用 `CopyFromBufferHandle` 把后端存储同步回可由 CPU 读的张量，用 `CopyToBufferHandle` 做反方向，用 `FreeBufferHandle` 清理该句柄及后端为它管理的资源；释放细节由 Delegate 实现定义，不能理解成永远不释放资源。没有相关回调往往意味着该方向的句柄操作不受支持，不意味着后端完全没有私有分配。
-
-| Flag | 读源码时看什么 |
-| --- | --- |
-| `AllowDynamicTensors` | 是否能处理动态张量及相应的输出形状变化。 |
-| `RequirePropagatedShapes` | 需要先把形状沿原执行计划传播，再准备对应的委托 kernel；它不是对所有 Delegate 无条件启用。 |
-| `PerOperatorProfiling` | 委托可以报更细粒度的内部算子事件，而不是只看整个分区。 |
-| `HintFullyDelegatedToSingleDelegate` | 某些路径可省去为原 CPU 图做的准备/分配。不是「每个后端天然可以接管全图」；原稿分支显式核对 `IsFullyDelegated`，不能满足则返回错误。该函数遍历当前执行计划检查节点是否带 delegate。 |
-
-创建期 `InterpreterBuilder::ApplyDelegates` 尝试显式传入的 Delegate，相关版本也处理自动获取的 Flex；不要把这段和 Resolver 默认工厂混在一起。Lazy Delegate 在 Builder 阶段保存 creator，通常由 Interpreter 首次 `AllocateTensors` 一类准备入口实际尝试（不是必须等到第一次 `Invoke`）。原稿的筛选条件是在启用 QS8 / QU8 构建时直接允许创建 provider，否则看是否有 FP32 张量；保存工厂仍不意味着创建成功，创建成功也不代表有节点可接管。
-
-### 4.1 为什么 XNNPACK 工厂可能返回空
-
-XNNPACK 是 CPU 推理内核库，XNNPACK Delegate 是其与 Interpreter 之间的适配层。原稿的 `MaybeCreateXNNPACKDelegate` 在未集成的构建里可能返回空；集成构建会合并默认 options，再按该版本的 QS8（有符号量化 8 位）/ QU8（无符号量化 8 位）支持配置构造对象。用带定制删除器的 `TfLiteDelegatePtr` 管理对象生命周期。
-
-- **线程池**：区分外部借用和自行拥有。借用运行时 CPU 后端的线程池不应由 Delegate 析构，独有池按配置创建与销毁。Emscripten 无 pthread 的构建不走相同的多线程代码，线程数并不是永远取 Interpreter 或 options 的同一个值。
-- **权重缓存**：权重重排（packing）把常量转换为更适合内核读取的布局；开启缓存可在其生命周期内复用重排结果。可借用用户传入的 cache/provider，也可按配置创建自有 provider。借用者要保证所有者寿命；文件路径、内存锁定、映射方式均看具体选项和平台。`LockMemory` 若实际启用，目标是尝试让相关页保持驻留，不能保证所有缺页都消失。
-
-### 默认 XNNPACK 注册的是工厂
-
-实际源码：[register.cc:414–426](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/kernels/register.cc#L414-L426)、[interpreter.cc:333–339](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter.cc#L333-L339)、[interpreter.cc:344–352](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter.cc#L344-L352)。
-
-```text
-BuiltinOpResolver 创建时：
-    注册 builtin，再保存一个尝试创建 XNNPACK 的工厂
-    不带默认委托的构造路径只注册 builtin
-触发 lazy 应用时：
-    如果已全委托或没有工厂，直接结束
-    取走工厂列表，避免重复尝试
-    逐项调用工厂；有对象才尝试改图
+struct OpData {
+  int32_t multiplier;
+  int32_t shift;
+  int input_offset;
+  int output_offset;
+  bool needs_rescale;
+  union {
+    int8_t* lut_int8;
+    int16_t* lut_int16;
+  };
+};
 ```
 
-1. 普通 `BuiltinOpResolver` 先装入 builtin 注册项，再追加一个 XNNPACK creator；不带默认委托的构造仍会注册 builtin，但没有这一步。
-2. 运行时才遍历 factory。没有 creator 或已完全委托就不做这一步；执行时先把列表 swap 出来，避免多次重复应用。
-3. 工厂返回空表示此项未创建；返回对象后才尝试 `ModifyGraphWithDelegateImpl()`。因此只看到 Resolver 构造成功不能断言 XNNPACK 生效。
+创建了一个名叫opdata的结构体，这个结构被用来储存算子的参数，主要用于量化算子
 
-## 5. 改写从 Interpreter 下沉到 Subgraph
+- multiplier 将浮点缩放系数表示成定点乘法系数
+- shift 配合multiplier，通过二进制移位实现缩放
+- input_offset, 输入tensor的量化零点
+- output_offset, 输出tensor的量化零点
+- needs_rescale, 是否要将结果从输入量化尺度转换到输出量化尺度
+- lut_int8, INT8算子使用的查找表
+- lut_int16, INT16使用的查找表
 
-```text
-Interpreter::ModifyGraphWithDelegateImpl
-  → 每个适用的 Subgraph::ModifyGraphWithDelegate
-      → 保存原执行计划 / 检查状态、动态形状与适用性
-      → 切换为 DelegateContext
-      → TfLiteDelegatePrepareInternal（opaque 或普通回调）
-          → Delegate 选节点并调用 ReplaceNodeSubsetsWithDelegateKernels
-      → 切回 KernelContext
-      → 检查覆盖范围、更新形状/内存及状态
+有一些计算形式的代价较高比如log，但是输入的范围又有限，所以存在直接的查找表，可以从中找到对应输入的输出
+
+```cpp
+void ElementWiseQuantizedFree(TfLiteContext* context, void* buffer) {
+  OpData* data = static_cast<OpData*>(buffer);
+  if (data && data->lut_int8) {
+    delete[] data->lut_int8;
+  }
+  delete data;
+}
 ```
 
-原稿的 Interpreter 级实现会先按下标建立 Subgraph 信息并校验，而后逐个处理适用子图；有失败清理和恢复路径。Subgraph 在准备原图时按 `execution_plan_` 的索引调用 `PrepareOpsStartingAt`，跟踪是否出现动态输出及准备进度。开始一轮与从中间继续不同，不能把每次的动态张量检测都当成独立的全图检查。Prepare 可能添加临时张量，所以会预留向量容量，避免底层存储意外移动；也不要自行长期持有会失效的元素指针。
+free相对应的清除了data的数据以及data中保留的查找表
 
-不能处理动态张量且没有全委托提示时，原计划通常需要先准备，用于识别动态形状。全委托的优化路径允许 Delegate 自行完成准备；否则不能简单跳过。原来是 Immutable 时，有些路径暂置 Uninvokable 以执行再次准备；失败时按错误阶段和状态恢复原计划或移除委托，不能假定任何报错都等于「已经安全 CPU 回退」。
+```cpp
+#define GENERIC_PREPARE(function_name, is_supported_type_function, type_name)  \
+  static TfLiteStatus function_name(TfLiteContext* context,                    \
+                                    TfLiteNode* node) {                        \
+    return elementwise::GenericPrepare(context, node,                          \
+                                       is_supported_type_function, type_name); \
+  }
 
-### 5.1 从选择 Prepare 入口到实际调用
-
-[委托入口与动态能力判断](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L2588-L2651)里，**应用 Delegate 之前也可能调用普通算子的 Prepare**。已经处于 `kStateInvokableAndImmutable` 的子图，先改回未就绪，给后续重新准备留出空间；否则，若新委托既不支持动态张量，又没有「单一委托接管全图」提示，就从位置 0 准备当前执行计划，提前探测动态输出。如果探测到动态张量，源码先让内存分配回到一致状态，再返回 `kTfLiteApplicationError`。这个探测不是运行推理，也不是委托自己的图编译。
-
-#### 5.1.1 PrepareOpsStartingAt：循环一项一项看
-
-[固定版本源码：逐节点准备](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L1584-L1625)
-
-```text
-输入：开始位置 start、要读的计划 plan、用于写回的位置 last
-仅当 start == 0：
-    扫一遍子图输出，初始化动态标记（包括直接透传的输出）
-从 start 开始逐项处理：
-    plan[位置] → 节点编号 → (TfLiteNode, TfLiteRegistration)
-    为可能新增的 Tensor 槽预留容量
-    如启用编译期追踪，记录这次准备事件
-    result = 按 registration 调用 OpPrepare
-    若 result 既非 OK 也非 OutputShapeNotKnown：
-        上报这一节点的失败并结束，不推进 last
-    last = 当前计划位置
-    若该节点有动态输出，或 result == OutputShapeNotKnown：
-        标记子图存在动态张量；以 OK 结束这一轮
-走完整个可准备区间后，以 OK 结束
+GENERIC_PREPARE(PrepareAbs, elementwise::IsAbsSupportedType,
+                elementwise::kAbsName)
 ```
 
-1. **先扫边界，再扫节点。** 子图有时原样透传某个输入，没有算子产生该输出，单查节点的 `outputs` 会漏掉它。只有从 0 开始才重新扫描子图边界；从后续位置续跑不重置这段状态。
-2. **区分三个编号。** 计划位置用于推进或恢复，节点编号用于找 `nodes_and_registration_`，Tensor 编号用于找张量表。比如计划为 `[7, 2, 9]`，从位置 1 开始准备的是节点 2，写回的进度仍是位置 1，不是节点 2。
-3. **扩容不是分配数据。** [EnsureTensorsVectorCapacity](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L2561-L2569)在回调之前按「当前大小加预留量」检查容量，需要时按所需容量与扩容比例的较大值 `reserve`，随后刷新 `context_.tensors`。它不增加张量数量、不为推理数据分配 arena，也不保证此前取到的地址不会失效。
-4. **何时暂停。** 动态的是节点**输出**才会在这里截断准备；动态临时张量不影响其他节点的输出尺寸，因此不单独构成暂停条件。内核返回 `kTfLiteOutputShapeNotKnown` 即便没有在输出扫描里找到明确的动态 Tensor，也会暂停；不要把它和真正的 Prepare 失败混为一谈。暂停的节点已记为本轮最后准备位置，但并未执行。
-5. **记录的对象不同。** `last_execution_plan_index_prepared` 是位置，`dynamic_tensor_index_` 是动态 Tensor 的编号。后者在张量扫描中更新，不能当成恢复游标；仅返回「形状未知」的场合也不一定提供一个新的编号。
+LiteRT使用了宏来辅助生成prepare函数，最后还是执行到elementwise中
 
-#### 5.1.2 OpPrepare：选择哪一个回调
-
-[固定版本源码：普通与不透明回调](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L1419-L1491)
-
-| 按顺序判断的情形 | 实际路径 |
-| --- | --- |
-| 有 `registration_external`，且 wrapper 记录了原节点编号 | 通过节点编号取原 `TfLiteRegistration`，调用原实现的 Prepare。 |
-| 外部对象提供 `prepare_with_data` | 使用外部对象自己的 `user_data`；传入不透明 Context 和 Node。它不是 `TfLiteNode::user_data`。 |
-| 外部对象只提供 `prepare` | 调用无 data 参数的不透明回调。 |
-| 以上都未接管 | 回到普通 `registration.prepare`。 |
-| 最终没有回调 | 已解析的算子可以成功跳过；未解析的 Custom/Flex 占位项返回 `kTfLiteUnresolvedOps`。 |
-
-原笔记里「外部包装可以复用原生算子」的关键是第一行：有不透明对象不代表重写了一遍 ABS，也不代表每次都通过 ext 对象自身的回调。排查先看是不是 wrapper，再查两个回调和 user data 来源。
-
-#### 5.1.3 从 AllocateTensors 暂停，再从 Invoke 继续
-
-[准备与内存规划](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L1627-L1700) · [Invoke 续跑](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L1743-L1757) · [动态输出重置](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L1828-L1856)
-
-- **准备原计划与当前计划。** 若有已应用的委托要求先传播形状，并且保存了委托前的计划，例程先用原计划准备，再准备实际执行的计划。不要只根据字段名猜传参：该快照原计划分支写回 `next_original_execution_plan_index_to_prepare_`，实际传给调用的起点却是 `next_execution_plan_index_to_prepare_`。
-- **已经准备到哪里，只分配到哪里。** 当前计划的 Prepare 游标更新为 `last + 1`。需要时建立内存规划器并规划，再对本轮已准备区间执行分配；核对自定义分配后推进分配游标。Prepare 与分配是两步，不是 `OpPrepare` 调完就等于所有数据已分配。
-- **执行时继续。** 例如节点 7 的输出大小由输入内容决定，后续节点 2 依赖它。初始准备可先停在节点 7；Invoke 执行节点 7 后，走到计划位置 1 才继续准备节点 2。如果本轮执行让动态输出改变大小，准备起点重设为当前项之后；已超前规划的下游内存也会被重置。不会从计划位置 0 无条件重做整图。
-
-### 5.2 Delegate Prepare 前后为何要切换 Context
-
-实际源码：[subgraph.cc:2647–2662](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L2647-L2662)。
-
-```text
-首次应用委托时保留原执行计划
-Context 临时开放委托回调
-调用 Delegate 的 Prepare，记录结果
-恢复普通内核 Context
-按 Prepare 结果继续或恢复原计划
+```cpp
+TfLiteStatus GenericPrepare(TfLiteContext* context, TfLiteNode* node,
+                            IsSupportedType is_supported_type,
+                            const char* op_name) {
+  TF_LITE_ENSURE_EQ(context, NumInputs(node), 1);
+  TF_LITE_ENSURE_EQ(context, NumOutputs(node), 1);
+  const TfLiteTensor* input;
+  TF_LITE_ENSURE_OK(context, GetInputSafe(context, node, 0, &input));
+  TfLiteTensor* output;
+  TF_LITE_ENSURE_OK(context, GetOutputSafe(context, node, 0, &output));
+  TF_LITE_ENSURE_TYPES_EQ(context, input->type, output->type);
+  if (!is_supported_type(input->type)) {
+    TF_LITE_UNSUPPORTED_TYPE(context, input->type, op_name);
+  }
 ```
 
-1. 先保存首次改写前的 `execution_plan_`，为失败恢复保留原序列；前面的分支还会根据已应用委托、动态 Tensor 能力等决定是否先准备普通算子。
-2. `SwitchToDelegateContext()` 临时提供读取计划、查询节点、替换分区等接口，委托通过这些回调请求改图，不直接拥有 TFLite 子图。
-3. Prepare 返回后切回普通 kernel Context，再处理错误；不要把“某个节点不支持”与“整个 Delegate Prepare 失败”混为一谈。
+对一系列的值做了检查，其中支持的类型包含以下四种type == kTfLiteFloat32 || type == kTfLiteInt8 ||
+         type == kTfLiteInt16 || type == kTfLiteInt32
 
-## 6. XNNPACK 如何决定接管哪些节点
-
-`DelegatePrepare` 先找候选，再向 Subgraph 发出改写请求。判断不是只看 opcode，还依赖参数、张量类型、形状、常量属性及实际 kernel 覆盖。在原稿的实现中，常规节点与 MoE 节点分组提交。这里的 MoE 是特定自定义算子，不代表 XNNPACK 会识别任意写成通用子图的专家网络：路由输入决定选哪些专家，权重/scale 的数量和类型都属于匹配条件。原稿分支的匹配包括指定 custom 名称、可解析属性（专家数和隐藏/模型维度等）、单输出、浮点权重 7 输入或量化权重 10 输入、FP32 激活/权重系数/输出与 INT32 路由索引；专家权重静态且形状、类型、元素数正确，量化 scale 也须静态且符合要求。这些是该版本检查项，不是跨版本的 MoE 接口规范。
-
-#### XNNPACK 先枚举节点，再做能力检查
-
-实际源码：[xnnpack_delegate.cc:7316–7336](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/delegates/xnnpack/xnnpack_delegate.cc#L7316-L7336)、[xnnpack_delegate.cc:7517–7541](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/delegates/xnnpack/xnnpack_delegate.cc#L7517-L7541)、[xnnpack_delegate.cc:7872–7915](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/delegates/xnnpack/xnnpack_delegate.cc#L7872-L7915)。
-
-```text
-读取当前执行计划和对应节点
-先把每个输入 Tensor 的消费者登记下来
-逐节点做 VisitNode 检查：
-    能接：登记候选和所需的准静态输入
-    不能接：保留给普通内核，并保留它依赖的原转换
-DelegatePrepare 拿到候选后：
-    普通候选集合非空时，请 Runtime 按依赖替换
-    MoE 候选在该快照逐个提交为单节点分区
+```cpp
+  if (input->type == kTfLiteInt8 ||
+      (input->type == kTfLiteInt16 &&
+       input->quantization.type != kTfLiteNoQuantization)) {
+    TfLiteTensor* output = GetOutput(context, node, 0);
+    auto* op_data = static_cast<OpData*>(node->user_data);
+    TF_LITE_ENSURE_EQ(context, input->quantization.type,
+                      kTfLiteAffineQuantization);
+    TF_LITE_ENSURE_EQ(context, output->quantization.type,
+                      kTfLiteAffineQuantization);
 ```
 
-1. `execution_plan->data[i]` 才是节点编号；`i` 只是执行顺序中的位置。第一遍顺便建立 `Tensor 编号 → 消费者节点列表`，供后续判断静态转换是否仍被普通节点使用。
-2. `VisitNode()` 此时收到空的 XNNPACK subgraph，只检查算子、Tensor、参数能否支持。失败的节点不加入委托列表，普通内核继续负责；遇到仍被它消费的准静态结果，还要保留相应转换节点。
-3. `DelegatePrepare()` 拿到普通节点候选后通过 Context 提交给 TFLite 分区；是返回空指针才表示这一阶段错误，空列表并不等于错误。这个快照另有 MoE 单节点处理，不能把所有节点都看成一次普通替换。
+当前只支持最简单的仿射量化
 
-### 6.1 准静态张量：为什么一条计算边可以提前处理
-
-「准静态」输出虽然有生产节点，但从常量输入出发，可以在准备期得到。例如 INT8 权重转 FP32，或者把常量稀疏数据展开成稠密布局。实现首先建立 tensor 到消费节点的映射，然后记录准静态张量、其生产节点以及委托端实际需要展开的集合。
-
-- DEQUANTIZE：原稿检查单输入/输出、非稀疏的 FP16 或带有效量化参数的 INT8 输入、FP32 输出、只读常量或之前已识别的准静态来源。部分 FP16 权重在所有消费者都满足特定 FC/Conv/DepthwiseConv 权重槽位约束时可直用；若它是激活输入或被其他算子消费，就不能据此省略这步。
-- DENSIFY：以符合条件的只读稀疏常量为源，单输入/输出，类型一致；原稿列出 FP16、INT8、FP32。还要看该分支其余元数据检查。
-- 测试构建里还有用于暴露不支持算子的强制委托路径，不代表普通构建会禁用回退。
-
-用一个小图看这个限制：`常量 W → DEQUANTIZE → Wf → Conv`，若只有被委托的 Conv 需要 `Wf`，有机会在 Prepare 完成转换；若还有一个 CPU 节点读取 `Wf`，它必须继续得到合法数据。一个张量是不是常量，和能不能删除它的生产节点，是两个判断。
-
-准静态张量不是扫到就能删掉生产者。实际展开时，先按生产节点编号安排预展开，输入优先读已经展开的结果，否则读模型常量；再做反量化或稀疏转稠密，把结果放进 `static_unpacked_data`。只要还有没委托的分支要读这个结果，原转换节点仍要留给 Interpreter。比如 `INT8 权重 → DEQUANTIZE → FP32` 同时被委托和未委托的节点读取时，不能因为 XNNPACK 能预展开，就把原转换从执行计划中拿掉。[消费者与候选筛选](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/delegates/xnnpack/xnnpack_delegate.cc#L7517-L7542) · [预展开](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/delegates/xnnpack/xnnpack_delegate.cc#L7559-L7655)。
-
-#### 准静态权重、线程池和缓存不是同一个层次
-
-- **选择可提前做的转换。** `DEQUANTIZE` 在该路径要求一进一出、有效类型和已知的输入字节；部分 FP16 权重如果只被支持的权重槽消费，可直接使用，不是先造一份 FP32 再跳过。稀疏常量的 `DENSIFY` 还要看输入是否带 sparsity、输出是否与输入同类型。
-- **展开并记账。** 用生产者索引安排展开，找到节点并核对一进一出，从已展开缓存或静态常量读取输入，按输出大小建立缓冲区；反量化或转稠密之后，由 `static_unpacked_data` 按 Tensor 编号保存。再处理权重缓存映射和可省略的原转换节点，最后排序候选提交分区。这里的“提前”是委托准备期，不是模型转换工具预先改写了文件。
-- **执行资源的所有权另算。** XNNPACK 可借用 CPU Backend 的线程池，也可拥有自己的线程池；析构只释放自己拥有的。权重 cache 缓解的是 packing/重排成本，缓存 provider 负责查找和管理这些条目；它既不是 Thread Pool，也不是保存 Tensor 索引的表。外部 provider 与由 Delegate 创建的 provider 不能按同一套所有权处理。
-
-[准静态识别与检查](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/delegates/xnnpack/xnnpack_delegate.cc#L7413-L7542) · [展开与候选提交前的整理](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/delegates/xnnpack/xnnpack_delegate.cc#L7559-L7800)
-
-## 7. 从支持列表到新执行计划
-
-![图 4-3：Delegate：先选择受支持的节点，再按图分区改写](figures/08-delegate-partition.png)
-
-*图 4-3　Delegate：先选择受支持的节点，再按图分区改写。下面是示例，不是“所有支持节点必定合并”。原始图里 A、B、D 可委托，C 留给原内核。图分区允许时，A、B 合为一个委托分区，D 留作另一个；一个 Delegate 可负责多个分区，一个分区可包多个原节点。边界 Tensor 继续连接相邻分区或原生节点。*
-
-`ReplaceNodeSubsetsWithDelegateKernels` 先建立 DELEGATE 的 registration；opaque 路径还要维护外部算子对象的生命周期。随后通过 `PartitionGraph` 按依赖划分分区：区分委托和非委托节点，依赖就绪才能被调度；可合并时尽可能聚合，不要求原计划里的下标天然相邻，也不能破坏数据依赖与必要的控制顺序。如果禁止节点融合，则使用更保守的分法。分区阶段本身仍未改写计划。
-
-```text
-改写前（示意）：[节点 0 CPU, 节点 1 委托, 节点 2 委托, 节点 3 CPU]
-改写后        ：[节点 0 CPU, 委托节点 K(1,2), 节点 3 CPU]
+```cpp
+    const auto* input_params =
+        reinterpret_cast<TfLiteAffineQuantization*>(input->quantization.params);
+    const auto* output_params = reinterpret_cast<TfLiteAffineQuantization*>(
+        output->quantization.params);
+    TF_LITE_ENSURE(context, input_params != nullptr);
+    TF_LITE_ENSURE(context, input_params->scale != nullptr);
+    TF_LITE_ENSURE(context, input_params->scale->size > 0);
+    TF_LITE_ENSURE(context, input_params->zero_point->size > 0);
+    TF_LITE_ENSURE(context, output_params != nullptr);
+    TF_LITE_ENSURE(context, output_params->scale != nullptr);
+    TF_LITE_ENSURE(context, output_params->scale->size > 0);
+    TF_LITE_ENSURE(context, output_params->zero_point->size > 0);
+    op_data->input_offset = input_params->zero_point->data[0];
+    op_data->output_offset = output_params->zero_point->data[0];
+    if (input->type == kTfLiteInt16) {
+      TF_LITE_ENSURE_EQ(context, op_data->input_offset, 0);
+      TF_LITE_ENSURE_EQ(context, op_data->output_offset, 0);
+    }
+    const float input_scale = input_params->scale->data[0];
+    const float output_scale = output_params->scale->data[0];
+    op_data->needs_rescale = input_scale != output_scale;
+    if (op_name == kAbsName && op_data->needs_rescale) {
+      SetAbsOutputMultiplier(input_scale, output_scale, &op_data->multiplier,
+                             &op_data->shift);
 ```
 
-非委托分区把原节点下标写回新执行计划；委托分区构造包含原节点列表、边界输入/输出以及 delegate 引用的 params，将其作为新节点初始化数据。新节点和对应 kernel registration 保存进 `nodes_and_registration_` 并进入执行计划。原节点未必从存储中消失，**执行计划里的下标不再指向它们才是不逐个执行的原因。** 真正 Invoke 时走委托节点的回调，委托内部根据分区搭建并运行 XNNPACK 图，与原始 TFLite Subgraph 不是同一个对象。
+计算一个multiplier用于转换scale
 
-#### 拿到候选以后，真正改了哪张表
-
-实际源码：[subgraph.cc:564–574](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L564-L574)、[subgraph.cc:641–653](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L641-L653)、[subgraph.cc:667–681](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L667-L681)、[subgraph.cc:1235–1241](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L1235-L1241)。
-
-```text
-PartitionGraph 根据依赖关系与聚类配置生成分区
-清空当前执行计划
-依分区顺序：
-    普通分区 → 将原节点编号放回计划
-    委托分区 → 构造带边界张量的代理节点，将它加入计划
-    委托分区的边界输出与代理节点记录所属 Delegate
+```cpp
+    } else if (op_name == kRsqrtName) {
+      if (input->type == kTfLiteInt16) {
+        const void* lut_func_params = static_cast<const void*>(&output_scale);
+        const auto lut_func = [](float value, const void* lut_func_params) {
+          if (value <= 0.0f) {
+            const float output_scale =
+                *static_cast<const float*>(lut_func_params);
+            return std::numeric_limits<int16>::max() * output_scale;
+          }
+          return 1.0f / std::sqrt(value);
+        };
+        if (!op_data->lut_int16) {
+          op_data->lut_int16 = new int16_t[LUTSize<int16_t>()];
+        }
+        LUTPopulate<int16_t>(input_scale, input_params->zero_point->data[0],
+                             output_scale, output_params->zero_point->data[0],
+                             lut_func, lut_func_params, op_data->lut_int16);
+      } else {
+        SetRsqrtOutputMultiplier(input_scale, output_scale,
+                                 &op_data->multiplier, &op_data->shift);
+      }
+    } else if (op_name == kLogName) {
+      LogLUTPrepare(input->type, op_data, input_scale, op_data->input_offset,
+                    output_scale, op_data->output_offset);
+    }
+  }
 ```
 
-1. `PartitionGraph()` 根据依赖、控制边和聚类配置算出分区。相邻不保证同一分区，非相邻也不代表绝不可能合并；边界上只列该分区对外需要的 Tensor。
-2. 清空旧执行计划后，普通分区把原节点编号放回计划；由委托负责的分区用 `AddNodeWithParameters()` 追加代理节点。该函数在结束时将新节点编号放进计划。
-3. 代理节点持有分区输入、输出和委托初始化参数，边界输出 Tensor 也会记录所属委托。原节点记录不等于全部删除；推理走的是改写后的计划，不是简单按节点表下标遍历。
+LOG、RSQRT 等部分量化路径可借助查找表，不能推广成每个 ABS 都预计算查找表。
 
-把这段分成两次决策更容易看清：XNNPACK 决定**哪些节点能接**，TFLite 决定**哪些候选可以放在一个分区**。例如两个候选节点之间若隔着必须由普通内核执行、并且后一个候选依赖其输出的节点，就不能把两个候选合成一个代理节点；否则代理节点还没跑完，普通内核就等不到它所需的前半段结果。这个例子也解释了为什么只按原执行计划上连续的编号分组不够。
+```cpp
+  return context->ResizeTensor(context, output,
+                               TfLiteIntArrayCopy(input->dims));
+}
+```
 
-#### 分区边界怎样从依赖关系算出来
+resizetensor来自与subgraph创建时传入的静态函数指针，在之前的环节漏掉了
 
-[PartitionGraph 的 epoch 逻辑](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/graph_info.cc#L90-L259)
+### ResizeTensor 的快慢路径
 
-1. 起始时把没有节点生产的 Tensor 看作可用，例如外部输入和常量；有生产者的先标成未就绪。不要按 Tensor 编号大小判断依赖。
-2. 逐个考虑尚未安排的节点：输入的生产者以及控制前驱必须可用，候选与当前分区还必须是同一类型（委托或普通）。聚类/融合配置限制能否把不相邻节点吸收进来。
-3. 消费者从更早分区或图外拿到某个 Tensor 时，它成为当前分区的输入；若来自更早分区，它也成为生产分区的输出。图对外输出还要另行标到生产分区，即使后面没有节点消费。
-4. 先得到一组分区描述，才创建 Delegate 节点和刷新 `execution_plan_`。原节点及注册表仍用于保留依赖、恢复原计划等，不是划完分区就把整段对象删掉。
+对照：[ResizeTensor](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L1868-L1911) · [ResizeTensorImpl](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L2150-L2199)。
 
-### 7.1 分配结束后如何理解三种状态
+<details>
+<summary>展开这段 C++ 跟读代码</summary>
 
-- **Uninvokable**：需要准备或重新分配，不能执行。
-- **Invokable**：当前可执行，允许符合规则的后续调整。
-- **InvokableAndImmutable**：可执行但图受到不可变约束，典型情形是应用了不支持动态张量的 Delegate。
+```cpp
+TfLiteStatus Subgraph::ResizeTensor(TfLiteContext* context,
+                                    TfLiteTensor* tensor,
+                                    TfLiteIntArray* new_size) {
+  const bool can_reuse_allocation = [tensor, new_size, context] {
+    if (tensor->data.raw == nullptr) {
+      return false;
+    }
+    if (!EqualArrayAndTfLiteIntArray(tensor->dims, new_size->size,
+                                     new_size->data)) {
+      return false;
+    }
+    if (tensor->type == kTfLiteString || tensor->type == kTfLiteResource ||
+        tensor->type == kTfLiteVariant) {
+      return true;
+    }
+    size_t new_bytes = 0;
+    tflite::BytesRequired(tensor->type, tensor->dims->data, tensor->dims->size,
+                          &new_bytes, context);
+    return new_bytes == tensor->bytes;
+  }();
 
-原稿分支的尾部处理区分三类：当前委托不支持动态张量时通常确保内存分配并标记 Immutable（满足全委托提示可走优化分支）；当前委托支持动态、但旧图已 Immutable 时，重新 Prepare，若引入动态张量则恢复计划并报错；原图已 Invokable 且可动态时，刷新必要分配以保持一致。新图还未准备的普通路径可留待分配阶段。调试时按「Resolver 查找 → 普通内核 Prepare / 形状 → Delegate 选点 → 分区与边界 → 内存分配 → Invoke」顺序定位，不要把任何一个阶段的通过当成后续已经成功。
+  if (can_reuse_allocation) {
+    if (new_size != tensor->dims) {
+      TfLiteIntArrayFree(tensor->dims);
+      tensor->dims = new_size;
+    }
+    return kTfLiteOk;
+  }
 
-### 7.2 看失败发生在什么阶段，而不是只看“没用上委托”
+  return static_cast<Subgraph*>(context->impl_)
+      ->ResizeTensorImpl(tensor, new_size);
+}
+```
 
-| 观察到的现象 | 从哪里查 |
-| --- | --- |
-| creator 返回空 | 还没创建对象。看构建是否接入 XNNPACK，以及 resolver 工厂配置。 |
-| 某个候选未通过 `VisitNode` | 正常的能力筛选；其他可用分区仍可委托，该节点仍可由原内核执行。 |
-| 静态委托在预检查发现动态输出 | 在委托 Prepare 之前拒绝这次应用，返回 `kTfLiteApplicationError`。 |
-| Delegate Prepare 自己失败 | 先切回普通 Context，再按该路径恢复原执行计划并返回委托错误；不能说所有错误都无条件静默回退。 |
-| 声明整图委托提示，但仍有普通节点 | 应用时会验证 `IsFullyDelegated()`；不满足时报错，不把提示当成功结果。 |
+</details>
 
-查最后三项时对照 [预检查、改图、状态恢复](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L2588-L2711)。把断点放在入口、`PrepareOpsStartingAt`、`TfLiteDelegatePrepareInternal` 和 `ReplaceNodeSubsetsWithDelegateKernels`，就能判断失败是在普通内核准备、后端选点、分区替换，还是分配这一段。
+快路径要求已有数据指针且 shape 完全相同；定长类型还需字节数匹配。命中只更新等价的尺寸对象，不进入 `ResizeTensorImpl()`。
 
-## 源码导航
+```cpp
+TfLiteStatus Subgraph::ResizeTensorImpl(TfLiteTensor* tensor,
+                                        TfLiteIntArray* new_size) {
+  if (tensor->allocation_type == kTfLiteArenaRw ||
+      tensor->allocation_type == kTfLiteDynamic ||
+      tensor->allocation_type == kTfLiteArenaRwPersistent ||
+      tensor->allocation_type == kTfLitePersistentRo ||
+      tensor->allocation_type == kTfLiteCustom ||
+      tensor->allocation_type == kTfLiteNonCpu) {
+    tensor_resized_since_op_invoke_ |=
+        TfLiteIntArrayEqual(tensor->dims, new_size) == 0;
+    if (tensor->type != kTfLiteString && tensor->type != kTfLiteResource &&
+        tensor->type != kTfLiteVariant) {
+      size_t bytes_required;
+      TfLiteStatus status =
+          tflite::BytesRequired(tensor->type, new_size->data, new_size->size,
+                                &bytes_required, &context_);
+      if (status != kTfLiteOk) {
+        TfLiteIntArrayFree(new_size);
+        return kTfLiteError;
+      }
 
-代码对照版本：LiteRT [`e3c11f0`](https://github.com/google-ai-edge/LiteRT/tree/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62)；流程块是按固定版本整理的阅读稿；可以点对应行号看完整实现。
+      status = TfLiteTensorResizeMaybeCopyWithAllocator(bytes_required, tensor,
+                                                        false, allocator_);
+      if (status != kTfLiteOk) {
+        TfLiteIntArrayFree(new_size);
+        return status;
+      }
+      tensor->bytes = bytes_required;
+    }
+```
 
-- [OpResolver 接口](https://github.com/google-ai-edge/LiteRT/blob/main/tflite/core/api/op_resolver.h) · [MutableOpResolver](https://github.com/google-ai-edge/LiteRT/blob/main/tflite/mutable_op_resolver.cc) · [内建注册](https://github.com/google-ai-edge/LiteRT/blob/main/tflite/core/kernels/register.cc)
-- [C 数据结构与 Delegate flags](https://github.com/google-ai-edge/LiteRT/blob/main/tflite/core/c/common.h) · [Elementwise 示例](https://github.com/google-ai-edge/LiteRT/blob/main/tflite/kernels/elementwise.cc)
-- [Interpreter](https://github.com/google-ai-edge/LiteRT/blob/main/tflite/core/interpreter.cc) · [Subgraph](https://github.com/google-ai-edge/LiteRT/blob/main/tflite/core/subgraph.cc) · [图分区](https://github.com/google-ai-edge/LiteRT/blob/main/tflite/graph_info.cc) · [XNNPACK Delegate](https://github.com/google-ai-edge/LiteRT/blob/main/tflite/delegates/xnnpack/xnnpack_delegate.cc)
+对普通类型先计算所需字节，再按 allocation 策略调整堆存储。String、Resource 和 Variant 不采用同一套字节数公式。
+
+```cpp
+    if (tensor->dims && tensor->dims != new_size) {
+      TfLiteIntArrayFree(tensor->dims);
+    }
+    tensor->dims = new_size;
+
+    if (tensor->allocation_type == kTfLiteArenaRw ||
+        tensor->allocation_type == kTfLiteArenaRwPersistent) {
+      tensor->data.raw = nullptr;
+    }
+```
+
+其他情况下如果现有的维度不等则更新维度，如果需要arena memory planner申请内存就将data清空
+
+```cpp
+  } else {
+    TfLiteIntArrayFree(new_size);
+    ReportError("Attempting to resize a fixed-size tensor.");
+    return kTfLiteError;
+  }
+  return kTfLiteOk;
+}
+```
+
+Resize 与最终分配不一定同一步发生：堆可立即调整，Arena 由后续内存规划分配；固定只读字节不允许在这里调整。
+
+### Invoke：普通、量化和 INT16 路径
+
+```cpp
+TfLiteStatus AbsEval(TfLiteContext* context, TfLiteNode* node) {
+  const TfLiteTensor* input = GetInput(context, node, 0);
+  const TfLiteType type = input->type;
+  switch (type) {
+    case kTfLiteFloat32:
+      return EvalImpl<float>(
+          context, node, [](float f) { return std::abs(f); }, type);
+    case kTfLiteInt8:
+      return AbsEvalQuantized<int8_t>(context, node, type);
+    case kTfLiteInt16:
+      return input->quantization.type == kTfLiteNoQuantization
+                 ? AbsInt16EvalImpl(context, node, type)
+                 : AbsEvalQuantized<int16_t>(context, node, type);
+    case kTfLiteInt32:
+      return EvalImpl<int32_t>(
+          context, node, [](int32_t i) { return std::abs(i); }, type);
+    default:
+      TF_LITE_KERNEL_LOG(context, "Current data type %s is not supported.",
+                         TfLiteTypeGetName(type));
+      return kTfLiteError;
+  }
+}
+```
+
+最后是invoke方法，根据tensor的数据类型主要包含两种实现方式，这里取tensor时是取的input中的第一个tensor。
+对于float32，int32的情况下会直接做evalimpl，evalimpl只是对原来最简单的std::abs方式做了一层封装，在外部额外检查了数据是否合法
+
+```cpp
+template <typename T>
+TfLiteStatus AbsEvalQuantized(TfLiteContext* context, TfLiteNode* node,
+                              TfLiteType type) {
+  const auto* op_data = static_cast<const OpData*>(node->user_data);
+  const int kMin = std::numeric_limits<T>::min();
+  const int kMax = std::numeric_limits<T>::max();
+
+  std::function<T(T)> func = [&](T i) {
+    const int32_t value = std::abs(i - op_data->input_offset);
+    if (!op_data->needs_rescale) {
+      return static_cast<T>(
+          std::min(std::max(value + op_data->output_offset, kMin), kMax));
+    }
+    const int32_t output = MultiplyByQuantizedMultiplier(
+                               value, op_data->multiplier, op_data->shift) +
+                           op_data->output_offset;
+    return static_cast<T>(std::min(std::max(output, kMin), kMax));
+  };
+
+  return EvalImpl<T>(context, node, func, type);
+}
+```
+
+这里完成三件事，首先计算了量化输入消除zeropoint后的绝对值，之后判断输入与输出的scale是否不同，如果不同就通过整数运算重新量化，最后将结果限制到给定范围内，对INT8就是-128，127
+
+```cpp
+inline TfLiteStatus AbsInt16EvalImpl(TfLiteContext* context, TfLiteNode* node,
+                                     TfLiteType expected_type) {
+  const TfLiteTensor* input;
+  TF_LITE_ENSURE_OK(context, GetInputSafe(context, node, 0, &input));
+  TfLiteTensor* output;
+  TF_LITE_ENSURE_OK(context, GetOutputSafe(context, node, 0, &output));
+  TF_LITE_ENSURE_TYPES_EQ(context, input->type, expected_type);
+  const int64_t num_elements = NumElements(input);
+  const int16_t* in_data = GetTensorData<int16_t>(input);
+  int16_t* out_data = GetTensorData<int16_t>(output);
+  for (int64_t i = 0; i < num_elements; ++i) {
+    out_data[i] = static_cast<int16_t>(
+        std::abs<int32_t>(static_cast<int32_t>(in_data[i])));
+  }
+  return kTfLiteOk;
+}
+```
+
+普通 INT16 路径扩大中间运算位宽。中间值扩大并不自动保证写回 INT16 可表示所有结果，边界行为要看对应内核。
