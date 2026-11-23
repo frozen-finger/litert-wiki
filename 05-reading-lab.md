@@ -57,6 +57,20 @@ return z && z[0] == 4.0f && z[1] == 6.0f ? 0 : 6;
 
 做对照实验时要记录是否启用了默认 Delegate。以 TensorFlow v2.20.0 的相应 C++ API 为例，可用 `tflite::ops::builtin::BuiltinOpResolverWithoutDefaultDelegates` 代替上面的 resolver，同时不要显式添加 Delegate，再观察 builtin 路径。这和只指定 CPU 不是一回事：CPU 也可以运行委托后端。示例把 `model` 和 `resolver` 都保留到 Interpreter 使用结束，避免把模型字节的生命周期问题和执行错误混在一起。
 
+### 2.1 把 I/O 位置和 Tensor 编号分开
+
+上面的小模型恰好把 X、Y、Z 放在 T0、T1、T2，容易看不出两种下标的区别。读源码时可以换一个教学布局：令三个张量位于 T3、T7、T9，省略表中其他槽位，保持类型和形状不变。不需要改原示例代码中的输入位置。
+
+| 运行时列表 | API 参数 | 实际访问的张量 |
+| --- | --- | --- |
+| `inputs() == [3, 7]` | `typed_input_tensor<float>(0)` | T3（X） |
+| `inputs() == [3, 7]` | `typed_input_tensor<float>(1)` | T7（Y） |
+| `outputs() == [9]` | `typed_output_tensor<float>(0)` | T9（Z） |
+
+1. 在 [第三篇的 Builder I/O 小节](03-interpreter-builder.md#inputs--outputs-是怎样填进去的) 对照 `SetInputs/SetOutputs`，确认列表来自文件声明，不是从 ADD 的输入、输出反推的。
+2. 在 `AllocateTensors()` 成功后进 `typed_input_tensor<float>(0)`，依次看 `index == 0`、`inputs()[index] == 3` 和 `typed_tensor<float>(3)`。直接调用 `typed_tensor<float>(0)` 查的是 T0，不是 X；也不要反过来把 3 传给只有两项的 `typed_input_tensor`。
+3. ADD 节点保存 `inputs=[3,7]`、`outputs=[9]`。给 X、Y 填入 `[1,2]` 和 `[3,4]`，成功 Invoke 后从第 0 个输出读 T9，预期是 `[4,6]`。这里是对照用的假设布局，不是本仓库附带的模型文件。
+
 ## 3. 路线 B：用 CompiledModel 看外部 Buffer 怎样绑定
 
 ![图 5-2：同一个模型，两种外部调用顺序](figures/10-dual-execution.png)

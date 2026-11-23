@@ -8,6 +8,8 @@
 
 **阅读顺序**：文件字节与校验 → 从视图建 IR → Tensor/权重 → Operator/连边 → Signature、Metadata 与 Dispatch 资产。代码摘出关键分支；省略项不能直接用于编译。
 
+> 本篇新增的 C++ 节选核对自 LiteRT `e3c11f0`：各段链接固定到对应行，`// ...` 表示省略，无需将片段视为可独立编译的函数。[上游源码署名与许可证](THIRD_PARTY_LICENSES.md)
+
 ## 1. LiteRT 模型加载的整体调用链
 
 ![图 2-1：加载控制流：从字节视图到独立对象图](figures/03-load-pipeline.png)
@@ -98,6 +100,24 @@ Expected<FlatbufferWrapper::Ptr> FlatbufferWrapper::CreateFromAllocation(
 
 这段检查在 `BuildFromAllocation()` 之前。读不同版本时，先确认它的入口是否显式调用 `VerifyFlatbuffer()`。
 
+#### 从文件入口跟到校验分支
+
+源码节选：[flatbuffer_tools.cc:332–338](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/util/flatbuffer_tools.cc#L332-L338)。
+
+```cpp
+Expected<FlatbufferWrapper::Ptr> FlatbufferWrapper::CreateFromTflFile(
+    absl::string_view path, bool allow_modifications) {
+  auto error_reporter = tflite::DefaultErrorReporter();
+  auto allocation = tflite::GetAllocationFromFile(path.data(), error_reporter,
+                                                  allow_modifications);
+  return FlatbufferWrapper::CreateFromAllocation(std::move(allocation));
+}
+```
+
+1. 从 `CreateFromTflFile()` 开始：`GetAllocationFromFile()` 返回可访问的字节区域，`allow_modifications` 传递给底层 I/O 策略，不是在这里修改计算图。
+2. `CreateFromAllocation()` 先检查 Allocation，再用 `base()` 和 `bytes()` 校验 FlatBuffer；这两层失败分别是文件 I/O 和无效模型，不要合成同一个错误。
+3. `BuildFromAllocation(std::move(alloc))` 成功后，模型接管 Allocation；再由 Wrapper 持有模型。这解释了后面从 Packed Model 取出的视图为什么可以继续读取。
+
 ### 2.3 验证什么、不验证什么
 
 完整 FlatBuffers Schema Verifier 的检查重点包括：
@@ -167,6 +187,30 @@ StoredBufferManager buffer_manager_ = std::make_unique<BufferManager>();
 ```
 
 它允许模型在不同构造情形下**自己持有**一个 `BufferManager`，或**借用外部提供的** `BufferManager`。`std::variant` 区分的是所有权形态，不是复制了两份 Buffer 内容。
+
+#### 把模型和子图里的两层循环连起来
+
+源码节选：[model_load.cc:612–624](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L612-L624)。
+
+```cpp
+  const auto* packed_model = context.PackedModel();
+
+  if (packed_model->subgraphs()) {
+    const auto num_subgraphs = packed_model->subgraphs()->size();
+    for (auto i = 0; i < num_subgraphs; ++i) {
+      const auto* tfl_subgraph = packed_model->subgraphs()->Get(i);
+      if (tfl_subgraph == nullptr) {
+        return Error(kLiteRtStatusErrorInvalidFlatbuffer);
+      }
+      LITERT_RETURN_IF_ERROR(UnpackSubgraph(context, *tfl_subgraph,
+                                            litert_model->EmplaceSubgraph()));
+    }
+  }
+```
+
+1. 外层每读到一个文件子图，就用 `EmplaceSubgraph()` 建一个 IR 子图，再传给 `UnpackSubgraph()`。这里还没有创建 Interpreter。
+2. 进入 `UnpackSubgraph()` 后，才运行下一节的两遍 Tensor 循环。先创建对象、再填属性，让 `UnpackTensor()` 能引用编号更靠后的 Tensor；找到对象不等于其属性已经填完。
+3. 接下来的算子解包才把这些 Tensor 接成图；子图的对外 I/O 列表另有一轮，不依赖扫描算子的连线。
 
 ### 3.2 解包一个 Subgraph
 
@@ -286,6 +330,45 @@ if (buffer_ind != 0) {
 - `BufferRef<uint8_t>`：指向现有字节的**非拥有引用**，本身不负责释放底层内存。
 - `should_append`：用于保留“原始字节来自追加区域”的序列化语义，并非要求当前立刻执行文件追加。
 - `LiteRT BufferId`：是 `BufferManager` 内部的句柄，**不要求与原始 TFLite Buffer 索引相等**。
+
+#### `ReadBuffer()` 怎样选中字节来源
+
+源码节选：[model_load.cc:285–312](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L285-L312)。
+
+```cpp
+  const auto& tfl_buffer = **buffer;
+
+  if (tfl_buffer.offset() != 0) {
+    // Data is appended to the end of the flatbuffer.
+
+    const auto* alloc_base = context.AllocBase();
+    const auto offset = tfl_buffer.offset();
+    const auto size = tfl_buffer.size();
+    if (!IsRangeInAllocation(offset, size, context.AllocSize())) {
+      LITERT_LOG(LITERT_ERROR,
+                 "flatbuffer model has invalid external buffer range: offset "
+                 "%zu, size %zu, allocation size %zu",
+                 offset, size, context.AllocSize());
+      return Error(kLiteRtStatusErrorInvalidFlatbuffer);
+    }
+
+    return TflBufferContext{BufferRef<uint8_t>(alloc_base + offset, size),
+                            true};
+  } else if (tfl_buffer.data()) {
+    // Data is in the flatbuffer.
+
+    const auto* start = tfl_buffer.data()->data();
+    const auto size = tfl_buffer.data()->size();
+
+    return TflBufferContext{BufferRef<uint8_t>(start, size), false};
+  } else {
+    return TflBufferContext{};
+  }
+```
+
+1. `GetTflBuffer()` 先用文件下标定位 `Buffer`。非零 `offset` 优先，`IsRangeInAllocation()` 检查模型 Allocation 的范围后才能按偏移取字节。
+2. 没有追加偏移时才看 `data()`；如果两个来源都没有，返回空的 Buffer 上下文。两条路径都不打开独立的权重文件。
+3. 回到上面的调用方后，同一个文件下标可以复用同一个 IR Buffer ID；`should_append` 保留的是序列化布局，不是复制字节的命令。
 
 ### 4.3 途径 B：`Tensor.external_buffer != 0`
 
@@ -461,6 +544,45 @@ T1 ──input──▶ Op0
 
 `T2` 的 Defining Op 是 `Op0`，而 `Op1` 是 `T2` 的使用者。一个 Tensor 可以被多个 Op 使用，但在普通 SSA 风格图结构中通常应有明确的生产者。
 
+#### 顺着 `UnpackOp()` 看一条输入边
+
+源码节选：[model_load.cc:207–234](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L207-L234)。
+
+```cpp
+  const auto num_inputs = tfl_op.inputs() ? tfl_op.inputs()->size() : 0;
+  for (auto i = 0; i < num_inputs; ++i) {
+    const auto input_ind = tfl_op.inputs()->Get(i);
+    // Skipping optional input tensor.
+    if (input_ind == -1) {
+      continue;
+    }
+    if (input_ind < 0 ||
+        static_cast<size_t>(input_ind) >= parent.Tensors().size()) {
+      LITERT_LOG(LITERT_ERROR,
+                 "flatbuffer model has invalid op input index: %d", input_ind);
+      return kLiteRtStatusErrorInvalidFlatbuffer;
+    }
+    AttachInput(&parent.Tensor(input_ind), litert_op);
+  }
+
+  const auto num_outputs = tfl_op.outputs() ? tfl_op.outputs()->size() : 0;
+  for (auto i = 0; i < num_outputs; ++i) {
+    const auto output_ind = tfl_op.outputs()->Get(i);
+    if (output_ind < 0 ||
+        static_cast<size_t>(output_ind) >= parent.Tensors().size()) {
+      LITERT_LOG(LITERT_ERROR,
+                 "flatbuffer model has invalid op output index: %d",
+                 output_ind);
+      return kLiteRtStatusErrorInvalidFlatbuffer;
+    }
+    AttachOutput(&parent.Tensor(output_ind), litert_op);
+  }
+```
+
+1. 沿文件中的输入列表逐项取下标。可选输入的 `-1` 先跳过，不按负数索引访问 Tensor 表。
+2. 其他负值和越界属于无效模型。合法下标才取当前子图的 Tensor 并交给 `AttachInput()`，形成 Op 到 Tensor 的输入关联及 Tensor 到消费者的反向关系。
+3. 输出方向见同函数紧接的循环：用 `AttachOutput()` 建生产者关系。不要用这个函数来寻找整个子图的对外输入。
+
 ### 5.5 解析 Custom Options 与 Builtin Options
 
 **Custom Options：**
@@ -508,7 +630,7 @@ litert_subgraph.Outputs().push_back(
     &litert_subgraph.Tensor(tfl_output_ind));
 ```
 
-这一步负责的是 **Subgraph 对外边界**，而不是 Operator 之间的边。因此，`AttachInput/AttachOutput` 和 `Subgraph.Inputs()/Outputs()` 虽名字相似，职责不同。
+这一步负责的是 **Subgraph 对外边界**，而不是 Operator 之间的边。因此，`AttachInput/AttachOutput` 和 `Subgraph.Inputs()/Outputs()` 虽名字相似，职责不同。这里存的是 IR 对象引用；[第三篇的 Interpreter I/O](03-interpreter-builder.md#inputs--outputs-是怎样填进去的) 读同样的文件字段，但保存的是整数索引。
 
 ---
 
@@ -524,6 +646,41 @@ litert_subgraph.Outputs().push_back(
 - **`operator_codes`**：条件编译允许时保存算子类型目录。
 
 其中部分对象先调用 FlatBuffers 生成的 `UnPack()`，再转为 LiteRT 的内部表示。不能把这些信息都概括为“简单读取，无额外处理”，例如 Signature 解包还包含索引与数量校验。
+
+#### 按子图顺序整理 Signature 的别名
+
+源码节选：[model_load.cc:574–597](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L574-L597)。
+
+```cpp
+    // Keep signature input/output names in the same order as the subgraph.
+    std::vector<std::string> input_names;
+    std::vector<LiteRtTensor> input_tensors;
+    input_names.reserve(tfl_inputs.size());
+    for (auto& tensor : litert_subgraph->Inputs()) {
+      input_names.push_back(input_aliases.contains(tensor)
+                                ? input_aliases.at(tensor)
+                                : std::string(tensor->Name()));
+      input_tensors.push_back(tensor);
+    }
+    std::vector<std::string> output_names;
+    std::vector<LiteRtTensor> output_tensors;
+    output_names.reserve(tfl_outputs.size());
+    for (auto& tensor : litert_subgraph->Outputs()) {
+      output_names.push_back(output_aliases.contains(tensor)
+                                 ? output_aliases.at(tensor)
+                                 : std::string(tensor->Name()));
+      output_tensors.push_back(tensor);
+    }
+
+    parent.EmplaceSignature(litert_subgraph, std::move(input_names),
+                            std::move(input_tensors), std::move(output_names),
+                            std::move(output_tensors),
+                            tfl_signature->signature_key);
+```
+
+1. 前面先根据 Signature 的 Tensor 索引在所属子图定位对象，建立 `Tensor → 名称` 的表。
+2. 输出和输入各自按子图原来的 I/O 顺序遍历，给每个对象查别名，找不到就用 Tensor 自身名称。序列化的具名映射不必和子图 I/O 使用相同的顺序。
+3. 最终一项名称对应同位置的 Tensor 引用，不会多造一份 Tensor 或分配输入输出数据。
 
 ### 6.2 Dispatch Op 是什么
 
@@ -572,6 +729,37 @@ struct DispatchOpOptions {
 **重要区分：**`RegisterNonOwnedBuffer` 是为 IR 注册对 Bytecode 的引用；`AttachAssetToOp` 是建立资产与 Op 的关联。**这一步并未执行 Bytecode，也不等于已经完成后端编译或初始化。**
 
 原始代码通过 `bytecode_offset` 作为查重 Key；这一选择有利于对相同位置的资产复用，但在推理其普遍正确性时，应注意它依赖序列化约定和范围检查。
+
+#### Dispatch Op 怎样找到已有的 Bytecode
+
+源码节选：[model_load.cc:742–761](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L742-L761)。
+
+```cpp
+          if (!IsRangeInAllocation(dispatch_opts.bytecode_offset,
+                                   dispatch_opts.bytecode_size,
+                                   allocation_size)) {
+            LITERT_LOG(LITERT_ERROR,
+                       "dispatch op bytecode range is outside the model "
+                       "allocation: offset %zu, size %zu, allocation size %zu",
+                       dispatch_opts.bytecode_offset,
+                       dispatch_opts.bytecode_size, allocation_size);
+            return Error(kLiteRtStatusErrorInvalidFlatbuffer);
+          }
+          BufferRef<uint8_t> byte_code(
+              model_flatbuffer.AllocBase() + dispatch_opts.bytecode_offset,
+              dispatch_opts.bytecode_size);
+          const BufferManager::BufferId buf_id =
+              model->Buffers()->RegisterNonOwnedBuffer(byte_code);
+          buffer_id_map.insert({dispatch_opts.bytecode_offset, buf_id});
+        }
+
+        model->AttachAssetToOp(op, buffer_id_map[dispatch_opts.bytecode_offset],
+                               std::move(dispatch_opts.name));
+```
+
+1. 进入这段之前已经根据 custom code 识别了 Dispatch Op，并从其选项取出 `offset`、`size` 和名称。副本 ID 表以偏移为键，只在还没登记该偏移时进入范围检查与注册。
+2. 边界检查针对整个模型 Allocation。成功后构造 `BufferRef`，登记的是非拥有的字节视图；相同偏移的其他 Dispatch Op 复用已登记的 ID。
+3. `AttachAssetToOp()` 只挂资产与名字，不在这时执行 Bytecode。本段是所给快照的文件加载路径，不代表所有加载入口都做相同步骤。
 
 ### 6.4 到此为止完成了什么
 
