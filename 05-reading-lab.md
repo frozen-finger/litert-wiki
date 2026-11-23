@@ -1,6 +1,6 @@
 # LiteRT 源码笔记（五）：用一个 ADD 串起模型与执行
 
-[上一篇：Resolver 与 Delegate](04-resolver-delegate.md) · [系列目录](README.md)
+[上一篇：图分区与代理节点](04e-delegate-partition.md) · [系列目录](README.md)
 
 前几篇分别讲模型里的表和索引、LiteRT 的模型 IR、Interpreter 的构建，以及算子与 Delegate。这篇固定一个很小的模型，沿着两套 C++ API 各走一遍。模型只有一个节点，读到哪里都容易知道当前对象来自哪一张表。
 
@@ -51,7 +51,7 @@ return z && z[0] == 4.0f && z[1] == 6.0f ? 0 : 6;
 按源码断点来读：
 
 1. **Builder 建图。** 在 `BuildLocalIndexToRegistrationMapping` 看 `opcode_index` 如何查到 `ADD` 注册项；然后看节点的张量索引如何传给子图。到这里已经知道执行的是哪个节点，但还没有写入本次输入。
-2. **AllocateTensors 准备。** 跟踪子图的 `PrepareOpsAndTensors` 与注册项的 `prepare` 回调。对于静态的示例，可以在这一步之后看输入输出的内存；有动态 shape 的模型，某些输出只能在执行时确定，因此不能用本例推断所有 tensor 都已分配。用 `ResizeInputTensor` 改形状后，要按 API 要求重新分配并重新取得指针。若换一个输出尺寸由输入数据决定的模型，可以跟进 [Prepare 的暂停点与 Invoke 续跑](04-resolver-delegate.md#513-从-allocatetensors-暂停再从-invoke-继续)，分别观察准备位置、动态 Tensor 编号和分配位置。上面的静态 ADD 不会触发这个分支。
+2. **AllocateTensors 准备。** 跟踪子图的 `PrepareOpsAndTensors` 与注册项的 `prepare` 回调。对于静态的示例，可以在这一步之后看输入输出的内存；有动态 shape 的模型，某些输出只能在执行时确定，因此不能用本例推断所有 tensor 都已分配。用 `ResizeInputTensor` 改形状后，要按 API 要求重新分配并重新取得指针。若换一个输出尺寸由输入数据决定的模型，可以跟进 [Prepare 的暂停点与 Invoke 续跑](04b-interpreter-prepare.md#3-allocatetensors-暂停后invoke-怎样继续)，分别观察准备位置、动态 Tensor 编号和分配位置。上面的静态 ADD 不会触发这个分支。
 3. **Invoke 执行。** 进入 `Subgraph::Invoke` 后看实际执行计划。未委托的节点会走注册项对应的执行回调；如果默认或显式 Delegate 已接管节点，就可能经过 Delegate 节点。从主线找不到 builtin ADD 的调用时，先确认当前执行计划，而不是先怀疑 ADD 没有运行。
 
 做对照实验时要记录是否启用了默认 Delegate。以 TensorFlow v2.20.0 的相应 C++ API 为例，可用 `tflite::ops::builtin::BuiltinOpResolverWithoutDefaultDelegates` 代替上面的 resolver，同时不要显式添加 Delegate，再观察 builtin 路径。这和只指定 CPU 不是一回事：CPU 也可以运行委托后端。示例把 `model` 和 `resolver` 都保留到 Interpreter 使用结束，避免把模型字节的生命周期问题和执行错误混在一起。
@@ -66,7 +66,7 @@ return z && z[0] == 4.0f && z[1] == 6.0f ? 0 : 6;
 | `inputs() == [3, 7]` | `typed_input_tensor<float>(1)` | T7（Y） |
 | `outputs() == [9]` | `typed_output_tensor<float>(0)` | T9（Z） |
 
-1. 在 [第三篇的 Builder I/O 小节](03-interpreter-builder.md#inputs--outputs-是怎样填进去的) 对照 `SetInputs/SetOutputs`，确认列表来自文件声明，不是从 ADD 的输入、输出反推的。
+1. 在 [Builder（一）的 I/O 小节](03-interpreter-builder.md#inputs--outputs-是怎样填进去的) 对照 `SetInputs/SetOutputs`，确认列表来自文件声明，不是从 ADD 的输入、输出反推的。
 2. 在 `AllocateTensors()` 成功后进 `typed_input_tensor<float>(0)`，依次看 `index == 0`、`inputs()[index] == 3` 和 `typed_tensor<float>(3)`。直接调用 `typed_tensor<float>(0)` 查的是 T0，不是 X；也不要反过来把 3 传给只有两项的 `typed_input_tensor`。
 3. ADD 节点保存 `inputs=[3,7]`、`outputs=[9]`。给 X、Y 填入 `[1,2]` 和 `[3,4]`，成功 Invoke 后从第 0 个输出读 T9，预期是 `[4,6]`。这里是对照用的假设布局，不是本仓库附带的模型文件。
 

@@ -2,7 +2,7 @@
 
 [第一篇](01-model-format.md)从 `.tflite` 字节读出了子图、张量和操作数索引。本篇从 `Model::CreateFromFile()` 往下走，看这些索引如何成为 LiteRT 内部对象和边，以及权重数据为何经常不必复制。加载成功并不意味着执行资源准备完毕。
 
-**两条源码路径不要混用**：本篇的 `LiteRtModelT` 属于 LiteRT Model API；[第三篇](03-interpreter-builder.md)谈的是兼容的 TFLite `InterpreterBuilder` 路径，它从 `tflite::Model` 或 `FlatBufferModel` 等入口构造自己的运行时结构，并不要求先经过本篇的 `UnpackModel()`。
+**两条源码路径不要混用**：本篇的 `LiteRtModelT` 属于 LiteRT Model API；[InterpreterBuilder（一）](03-interpreter-builder.md)谈的是兼容的 TFLite `InterpreterBuilder` 路径，它从 `tflite::Model` 或 `FlatBufferModel` 等入口构造自己的运行时结构，并不要求先经过本篇的 `UnpackModel()`。
 
 **源码基准**：以 LiteRT [`e3c11f0`](https://github.com/google-ai-edge/LiteRT/tree/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62) 的加载实现为对照。算子循环、同文件追加选项、外部权重组的行为并非所有版本都相同。
 
@@ -578,7 +578,7 @@ litert_subgraph.Outputs().push_back(
     &litert_subgraph.Tensor(tfl_output_ind));
 ```
 
-这一步负责的是 **Subgraph 对外边界**，而不是 Operator 之间的边。因此，`AttachInput/AttachOutput` 和 `Subgraph.Inputs()/Outputs()` 虽名字相似，职责不同。这里存的是 IR 对象引用；[第三篇的 Interpreter I/O](03-interpreter-builder.md#inputs--outputs-是怎样填进去的) 读同样的文件字段，但保存的是整数索引。
+这一步负责的是 **Subgraph 对外边界**，而不是 Operator 之间的边。因此，`AttachInput/AttachOutput` 和 `Subgraph.Inputs()/Outputs()` 虽名字相似，职责不同。这里存的是 IR 对象引用；[Builder（一）的 Interpreter I/O](03-interpreter-builder.md#inputs--outputs-是怎样填进去的) 读同样的文件字段，但保存的是整数索引。
 
 ---
 

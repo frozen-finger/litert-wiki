@@ -1,37 +1,25 @@
 # LiteRT Wiki｜从模型文件到推理执行
 
-面向想读端侧推理框架源码的开发者。这组中文笔记沿着同一个问题展开：一个 `.tflite` 文件被读进进程之后，张量、节点和内存分别在哪里建立，最后又由谁执行？
+面向想读端侧推理框架源码的开发者：一个 `.tflite` 文件进入进程之后，张量、节点和内存分别在哪里建立，最后又由谁执行？
 
 ## 阅读目录
 
-| 顺序 | 篇目 | 这一篇主要回答 |
-| --- | --- | --- |
-| 一 | [模型文件与 FlatBuffers](01-model-format.md) | 文件里的 offset 和索引怎么看？图、签名、权重和量化参数存在哪？ |
-| 二 | [加载模型与内部 IR](02-load-model-ir.md) | 字节如何映射、验证和解包？常量数据由谁持有？ |
-| 三 | [InterpreterBuilder 与运行时建图](03-interpreter-builder.md) | Builder 如何从 FlatBuffer 建立 Subgraph、Tensor 和节点？ |
-| 四 | [OpResolver、Registration 与 Delegate](04-resolver-delegate.md) | 一个算子如何找到实现？图分区、默认委托和失败回退如何工作？ |
-| 五 | [用一个 ADD 串起模型与执行](05-reading-lab.md) | 怎样把表索引、运行时 Buffer 与实际执行逐步对应起来？ |
+| 主题 | 篇目 |
+| --- | --- |
+| 模型文件与加载 | [从 FlatBuffers 读懂模型](01-model-format.md) · [加载模型、权重与内部 IR](02-load-model-ir.md) |
+| InterpreterBuilder | [（一）创建 Interpreter 和运行时子图](03-interpreter-builder.md) · [（二）Tensor、权重与量化](03b-interpreter-tensors.md) · [（三）算子节点、Signature 与构建收尾](03c-interpreter-nodes.md) |
+| Interpreter 执行 | [（一）Resolver、Registration 与 ABS](04-resolver-delegate.md) · [（二）Prepare、内存分配与动态 Invoke](04b-interpreter-prepare.md) |
+| Delegate | [（一）创建、应用与执行资源](04c-delegate-setup.md) · [（二）XNNPACK 如何选点与展开权重](04d-delegate-xnnpack.md) · [（三）图分区、代理节点与状态收尾](04e-delegate-partition.md) |
+| 实验 | [用一个 ADD 串起模型与执行](05-reading-lab.md) |
 
-第一篇的格式知识两条路径通用；第二篇跟的是 LiteRT 模型加载到 IR 的路径，第三、四篇跟的是 TFLite 兼容 C++ Interpreter 路径。它们共用模型格式和部分底层实现，但 `LiteRtModelT → InterpreterBuilder` 不是这两份源码的直接调用链。第一次读可以先看第一篇，再对照第五篇的小图回到各自的实现。
-
-流程块按源码分支和调用顺序整理，行号链接可以直接打开对应版本的实现。遇到代码与其他版本不同，先确认你走的是 LiteRT Loader 还是 Interpreter，再查同名入口的参数和分支。
+**两条读取路径。** 模型格式知识通用，但 `LiteRtModelT` 属于 LiteRT 模型 IR；InterpreterBuilder 读取的是 TFLite FlatBuffer 视图，不需要先构建 `LiteRtModelT`。每篇把代码、分步说明及上游行号放在对应主题内；较长的片段可以展开，不用来回翻另一份文档。
 
 **按问题跳读**
 
-- [模型权重与 Buffer ID](02-load-model-ir.md#用两张-tensor-共用一份权重把-id-对上)：文件索引、内部句柄和外部权重分别从哪里来。
-- [Interpreter 的 I/O](03-interpreter-builder.md#inputs--outputs-是怎样填进去的)：从文件中的两个列表到运行时 Tensor 访问。
-- [PrepareOpsStartingAt](04-resolver-delegate.md#511-prepareopsstartingat循环一项一项看)：执行计划索引、动态输出暂停，以及后续怎样继续。
-- [分区边界](04-resolver-delegate.md#分区边界怎样从依赖关系算出来)：候选节点可以接管不等于可以合并。
-
-### 逐段源码精读
-
-前五篇便于先了解调用关系。下面三篇以原始 Interpreter 笔记的顺序整理，保留原有代码与逐步理解；较长的代码块可以展开。
-
-| 篇目 | 跟读路线 |
-| --- | --- |
-| [六、InterpreterBuilder](06-interpreter-builder-source.md) | 构造与注册映射 → 子图 → Tensor 与量化 → Node → Signature 与显式委托 |
-| [七、Resolver、ABS 与 XNNPACK 创建](07-resolver-kernel-source.md) | Resolver 注册 → 生命周期回调 → ABS/Resize → 委托工厂、线程池和权重缓存 |
-| [八、Prepare 与 Delegate 图改写](08-prepare-delegate-source.md) | 逐节点准备与动态尺寸 → XNNPACK 选点和预展开 → 分区、代理节点及执行计划 |
+- [模型权重与 Buffer ID](02-load-model-ir.md#用两张-tensor-共用一份权重把-id-对上)
+- [Interpreter 的 I/O](03-interpreter-builder.md#inputs--outputs-是怎样填进去的)
+- [PrepareOpsStartingAt](04b-interpreter-prepare.md#1-prepareopsstartingat逐个执行计划位置准备)
+- [图分区的输入、输出和依赖](04e-delegate-partition.md#2-分区边界怎样从依赖关系算出来)
 
 ## 图例与本地阅读
 
