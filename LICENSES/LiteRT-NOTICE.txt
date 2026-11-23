@@ -1,0 +1,11 @@
+Source excerpts from LiteRT, commit e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62.
+https://github.com/google-ai-edge/LiteRT/tree/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62
+
+Distributed under Apache License 2.0. See Apache-2.0.txt.
+Excerpts are shortened and presented with explanatory text; this notice does not license the original Wiki prose.
+
+litert/core/model/model_load.cc、litert/core/util/flatbuffer_tools.cc：Copyright 2024 Google LLC.
+tflite/core/interpreter_builder.cc、tflite/core/interpreter.h、tflite/core/interpreter.cc、tflite/core/subgraph.cc：Copyright 2017 The TensorFlow Authors. All Rights Reserved.
+tflite/mutable_op_resolver.cc、tflite/kernels/elementwise.cc：Copyright 2018 The TensorFlow Authors. All Rights Reserved.
+tflite/core/kernels/register.cc：Copyright 2023 The TensorFlow Authors. All Rights Reserved.
+tflite/delegates/xnnpack/xnnpack_delegate.cc：Copyright 2020 The TensorFlow Authors. All Rights Reserved.

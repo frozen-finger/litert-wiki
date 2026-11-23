@@ -8,8 +8,6 @@
 
 **阅读顺序**：文件字节与校验 → 从视图建 IR → Tensor/权重 → Operator/连边 → Signature、Metadata 与 Dispatch 资产。代码摘出关键分支；省略项不能直接用于编译。
 
-> 本篇新增的 C++ 节选核对自 LiteRT `e3c11f0`：各段链接固定到对应行，`// ...` 表示省略，无需将片段视为可独立编译的函数。[上游源码署名与许可证](THIRD_PARTY_LICENSES.md)
-
 ## 1. LiteRT 模型加载的整体调用链
 
 ![图 2-1：加载控制流：从字节视图到独立对象图](figures/03-load-pipeline.png)
@@ -119,6 +117,8 @@ Expected<FlatbufferWrapper::Ptr> FlatbufferWrapper::CreateFromTflFile(
 3. `BuildFromAllocation(std::move(alloc))` 成功后，模型接管 Allocation；再由 Wrapper 持有模型。这解释了后面从 Packed Model 取出的视图为什么可以继续读取。
 
 ### 2.3 验证什么、不验证什么
+
+原笔记把这里拆成两次排查：先问「文件有没有变成可读字节」，再问「这些字节能不能按 TFLite Schema 解释」。两项都通过仍不代表图能用；例如某个算子引用了不存在的 Tensor，下文要等解包时才能发现。
 
 完整 FlatBuffers Schema Verifier 的检查重点包括：
 
@@ -235,12 +235,10 @@ for (size_t i = 0; i < packed_model->subgraphs()->size(); ++i) {
 const auto num_tensors =
     tfl_subgraph.tensors() ? tfl_subgraph.tensors()->size() : 0;
 
-// 第一次循环：创建所有 Tensor 对象
 for (auto i = 0; i < num_tensors; ++i) {
   litert_subgraph.EmplaceTensor();
 }
 
-// 第二次循环：逐个解析、填充已存在的 Tensor
 for (auto i = 0; i < num_tensors; ++i) {
   const auto* tfl_tensor = tfl_subgraph.tensors()->Get(i);
   auto& litert_tensor = litert_subgraph.Tensor(i);
@@ -339,23 +337,17 @@ if (buffer_ind != 0) {
   const auto& tfl_buffer = **buffer;
 
   if (tfl_buffer.offset() != 0) {
-    // Data is appended to the end of the flatbuffer.
 
     const auto* alloc_base = context.AllocBase();
     const auto offset = tfl_buffer.offset();
     const auto size = tfl_buffer.size();
     if (!IsRangeInAllocation(offset, size, context.AllocSize())) {
-      LITERT_LOG(LITERT_ERROR,
-                 "flatbuffer model has invalid external buffer range: offset "
-                 "%zu, size %zu, allocation size %zu",
-                 offset, size, context.AllocSize());
       return Error(kLiteRtStatusErrorInvalidFlatbuffer);
     }
 
     return TflBufferContext{BufferRef<uint8_t>(alloc_base + offset, size),
                             true};
   } else if (tfl_buffer.data()) {
-    // Data is in the flatbuffer.
 
     const auto* start = tfl_buffer.data()->data();
     const auto size = tfl_buffer.data()->size();
@@ -369,6 +361,8 @@ if (buffer_ind != 0) {
 1. `GetTflBuffer()` 先用文件下标定位 `Buffer`。非零 `offset` 优先，`IsRangeInAllocation()` 检查模型 Allocation 的范围后才能按偏移取字节。
 2. 没有追加偏移时才看 `data()`；如果两个来源都没有，返回空的 Buffer 上下文。两条路径都不打开独立的权重文件。
 3. 回到上面的调用方后，同一个文件下标可以复用同一个 IR Buffer ID；`should_append` 保留的是序列化布局，不是复制字节的命令。
+
+读 `offset` 时，可以先画出两个边界：FlatBuffer 主体的末尾，以及**整个模型文件**的末尾。权重可以在前一个边界之后，只要不越过后一个边界。这正是「文件里的追加区」和下面「独立权重文件」的区别。
 
 ### 4.3 途径 B：`Tensor.external_buffer != 0`
 
@@ -465,7 +459,6 @@ litert_tensor.SetQarams(
 
 ```cpp
 #if !defined(LITERT_NO_BUILTIN_OPS)
-  // 解包 Operator
 #endif
 ```
 
@@ -486,7 +479,6 @@ litert_tensor.SetQarams(
 关键字段可以按用途归纳为：
 
 ```cpp
-// 概念摘录：省略其他成员
 OwningBufferRef<uint8_t> custom_options_;
 std::vector<LiteRtTensor> inputs_;
 std::vector<LiteRtTensor> outputs_;
@@ -552,14 +544,11 @@ T1 ──input──▶ Op0
   const auto num_inputs = tfl_op.inputs() ? tfl_op.inputs()->size() : 0;
   for (auto i = 0; i < num_inputs; ++i) {
     const auto input_ind = tfl_op.inputs()->Get(i);
-    // Skipping optional input tensor.
     if (input_ind == -1) {
       continue;
     }
     if (input_ind < 0 ||
         static_cast<size_t>(input_ind) >= parent.Tensors().size()) {
-      LITERT_LOG(LITERT_ERROR,
-                 "flatbuffer model has invalid op input index: %d", input_ind);
       return kLiteRtStatusErrorInvalidFlatbuffer;
     }
     AttachInput(&parent.Tensor(input_ind), litert_op);
@@ -570,9 +559,6 @@ T1 ──input──▶ Op0
     const auto output_ind = tfl_op.outputs()->Get(i);
     if (output_ind < 0 ||
         static_cast<size_t>(output_ind) >= parent.Tensors().size()) {
-      LITERT_LOG(LITERT_ERROR,
-                 "flatbuffer model has invalid op output index: %d",
-                 output_ind);
       return kLiteRtStatusErrorInvalidFlatbuffer;
     }
     AttachOutput(&parent.Tensor(output_ind), litert_op);
@@ -589,7 +575,6 @@ T1 ──input──▶ Op0
 
 ```cpp
 if (tfl_op.large_custom_options_size() != 0) {
-  // 当前路径记录 Warning
 }
 const auto* custom_opts = tfl_op.custom_options();
 if (custom_opts) {
@@ -652,7 +637,6 @@ litert_subgraph.Outputs().push_back(
 源码节选：[model_load.cc:574–597](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L574-L597)。
 
 ```cpp
-    // Keep signature input/output names in the same order as the subgraph.
     std::vector<std::string> input_names;
     std::vector<LiteRtTensor> input_tensors;
     input_names.reserve(tfl_inputs.size());
@@ -738,11 +722,6 @@ struct DispatchOpOptions {
           if (!IsRangeInAllocation(dispatch_opts.bytecode_offset,
                                    dispatch_opts.bytecode_size,
                                    allocation_size)) {
-            LITERT_LOG(LITERT_ERROR,
-                       "dispatch op bytecode range is outside the model "
-                       "allocation: offset %zu, size %zu, allocation size %zu",
-                       dispatch_opts.bytecode_offset,
-                       dispatch_opts.bytecode_size, allocation_size);
             return Error(kLiteRtStatusErrorInvalidFlatbuffer);
           }
           BufferRef<uint8_t> byte_code(
@@ -760,6 +739,8 @@ struct DispatchOpOptions {
 1. 进入这段之前已经根据 custom code 识别了 Dispatch Op，并从其选项取出 `offset`、`size` 和名称。副本 ID 表以偏移为键，只在还没登记该偏移时进入范围检查与注册。
 2. 边界检查针对整个模型 Allocation。成功后构造 `BufferRef`，登记的是非拥有的字节视图；相同偏移的其他 Dispatch Op 复用已登记的 ID。
 3. `AttachAssetToOp()` 只挂资产与名字，不在这时执行 Bytecode。本段是所给快照的文件加载路径，不代表所有加载入口都做相同步骤。
+
+这里要注意：为什么查重键是 `bytecode_offset`，而不是 `(offset, size)`？这段代码把「同一偏移」当成「同一份资产」，因此必须依赖序列化端让引用同一偏移的记录指向同一段 Bytecode。范围检查与按偏移复用是两件事；不能仅凭这个表推断两条记录的长度已被逐一比对。
 
 ### 6.4 到此为止完成了什么
 

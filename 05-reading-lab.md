@@ -37,7 +37,6 @@ tflite::InterpreterBuilder builder(*model, resolver);
 if (builder(&interpreter) != kTfLiteOk || !interpreter) return 2;
 if (interpreter->AllocateTensors() != kTfLiteOk) return 3;
 
-// typed_input_tensor 的 0、1 是输入顺序，不是任意子图 tensor 编号。
 auto* x = interpreter->typed_input_tensor<float>(0);
 auto* y = interpreter->typed_input_tensor<float>(1);
 if (!x || !y) return 4;
@@ -80,21 +79,18 @@ return z && z[0] == 4.0f && z[1] == 6.0f ? 0 : 6;
 LiteRT 的 `CompiledModel` 接口把输入输出放在调用者持有的 `TensorBuffer` 对象中。下面按官方 `run_model_simple.cc` 的调用顺序摘出关键行，省略辅助函数、类型查询和输出比对的包装代码；`GetOptions()` 从示例配置中选 CPU，`path` 为模型路径。使用能取得签名索引 0、且该签名按 X/Y 顺序接受两个 float32 输入的测试模型。若手头模型没有符合假设的签名，先检查 API 反映出来的签名、输入输出布局和类型，不要硬套下面的下标。
 
 ```cpp
-// LITERT_ASSIGN_OR_RETURN：成功后取值；失败则提前返回错误。
 LITERT_ASSIGN_OR_RETURN(auto env, GetEnvironment());
 LITERT_ASSIGN_OR_RETURN(auto options, GetOptions());
 LITERT_ASSIGN_OR_RETURN(auto model, CompiledModel::Create(env, path, options));
 const size_t sig = 0;
 LITERT_ASSIGN_OR_RETURN(auto inputs, model.CreateInputBuffers(sig));
 LITERT_ASSIGN_OR_RETURN(auto outputs, model.CreateOutputBuffers(sig));
-// 输入顺序、数量、数据类型与大小已按本例假设核对。
 const std::array<float, 2> x{1.0f, 2.0f}, y{3.0f, 4.0f};
 std::array<float, 2> z{};
 LITERT_RETURN_IF_ERROR(inputs[0].Write<float>(absl::MakeConstSpan(x)));
 LITERT_RETURN_IF_ERROR(inputs[1].Write<float>(absl::MakeConstSpan(y)));
 LITERT_RETURN_IF_ERROR(model.Run(sig, inputs, outputs));
 LITERT_RETURN_IF_ERROR(outputs[0].Read<float>(absl::MakeSpan(z)));
-// 此时在测试函数中比较 z 与 [4.0f, 6.0f]。
 ```
 
 `CreateInputBuffers` 和 `CreateOutputBuffers` 按该签名的要求创建运行用 Buffer；`Write` 把这一轮的输入送进去；`Run` 把这些输入输出 Buffer 用于这次同步调用。模型文件里 `Tensor.buffer=0` 并不会取消这一步。反过来，如果把 `Y` 改为编入模型的常量，它还在子图的张量表和 ADD 的输入索引里，但不必继续作为签名的外部输入。

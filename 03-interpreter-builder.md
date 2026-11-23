@@ -6,15 +6,13 @@
 
 先区分两条路径：上一篇的 `LiteRtModelT` 是 LiteRT 用于表示和处理模型的 IR；本篇的 `InterpreterBuilder` 读取的是 **TFLite FlatBuffer 视图**，不是直接把 `LiteRtModelT` 强转成 `Interpreter`。在 LiteRT 的 CompiledModel 实现里，可以到 `compiled_model.cc` 查找 `tflite::InterpreterBuilder` 的实际调用点；上游版本和编译开关不同，转换步骤、构造参数或支持的特性也可能不同。
 
-> 本篇新增的 C++ 节选核对自 LiteRT `e3c11f0`：各段链接固定到对应行，`// ...` 表示省略，无需将片段视为可独立编译的函数。[上游源码署名与许可证](THIRD_PARTY_LICENSES.md)
-
 ## 1. 从 Builder 到 Interpreter
 
 ```cpp
 std::unique_ptr<tflite::Interpreter> interpreter;
 tflite::InterpreterBuilder builder(model, resolver);
 if (builder(&interpreter) != kTfLiteOk || !interpreter) {
-  // 处理构建失败；此处不进入推理。
+  // ...
 }
 ```
 
@@ -71,12 +69,7 @@ if (builder(&interpreter) != kTfLiteOk || !interpreter) {
       if (GetBuiltinCode(opcode) != BuiltinOperator_CUSTOM) {
         return status;
       }
-      // If it's an unresolved custom op, allow it for now. It might be resolved
-      // by a delegate later.
       if (!opcode->custom_code()) {
-        TF_LITE_REPORT_ERROR(
-            error_reporter_,
-            "Operator with CUSTOM builtin_code has no custom_code.\n");
         return status;
       }
       const auto* op_name = opcode->custom_code()->c_str();
@@ -123,7 +116,6 @@ Interpreter 初始化第 0 个 Subgraph；Builder 为序列化子图补齐运行
   if (modified_subgraph->AddTensors(tensors->size()) != kTfLiteOk) {
     return kTfLiteError;
   }
-  // Parse inputs/outputs
   modified_subgraph->SetInputs(FlatBufferIntArrayToVector(subgraph->inputs()));
   modified_subgraph->SetOutputs(
       FlatBufferIntArrayToVector(subgraph->outputs()));
@@ -146,16 +138,8 @@ TfLiteStatus Subgraph::SetOutputs(std::vector<int> outputs) {
 
 // ...
 
-  /// Read only access to list of inputs.
   const std::vector<int>& inputs() const { return primary_subgraph().inputs(); }
 
-  /// Return the name of a given input. The given index must be between 0 and
-  /// inputs().size().
-  const char* GetInputName(int index) const {
-    return context_->tensors[inputs()[index]].name;
-  }
-
-  /// Read only access to list of outputs.
   const std::vector<int>& outputs() const {
     return primary_subgraph().outputs();
   }
@@ -194,7 +178,7 @@ TfLiteStatus Subgraph::SetOutputs(std::vector<int> outputs) {
 | 可保持状态的定长变量 | `kTfLiteArenaRwPersistent` | 不按普通临时值复用，跨调用保留，仍可按规定重置 |
 | string/resource/variant 等特例 | `kTfLiteDynamic` | 走动态分配路径；支持的变量组合以实现为准 |
 
-原稿的只读路径对普通密集张量会核对理论字节数不大于实有 buffer；字符串、资源、Variant、稀疏和外部数据等不能照这个公式验，不是“跳过以后再用同一个公式验”。常量与 variable 冲突时不能简单把固定数据地址改为可写；见该版本的实际错误分支。地址不满足类型对齐时，原稿对应路径把数据复制到堆，清掉原 Allocation 引用，并用 `aligned_ro_buffers_` 管理副本。该路径额外补 16 字节供特定 SIMD 内核安全读取，不能据此推断所有 Tensor 都有相同 padding。只读是运行时的数据使用约定，与 OS 页权限不是一回事。
+普通密集常量会核对理论字节数不大于实际 Buffer；字符串、Resource、Variant、稀疏和外部数据不能套同一公式。
 
 #### `ParseTensors()` 为什么分读写两条路
 
@@ -209,11 +193,8 @@ TfLiteStatus Subgraph::SetOutputs(std::vector<int> outputs) {
     TfLiteQuantization quantization{};
     if (ParseQuantization(src_quantization, &quantization, dims,
                           tensors->size()) != kTfLiteOk) {
-      TF_LITE_REPORT_ERROR(error_reporter_,
-                           "Tensor %d has invalid quantization parameters.", i);
       status = kTfLiteError;
     }
-    if (subgraph_info) subgraph_info->quantizations[i] = quantization;
 
     std::vector<int> dims_signature = {};
     if (tensor->shape_signature()) {
@@ -224,24 +205,17 @@ TfLiteStatus Subgraph::SetOutputs(std::vector<int> outputs) {
 
 // ...
 
-
       if (subgraph->SetTensorParametersReadOnly(
               i, type, get_name(tensor), dims, quantization, buffer_ptr,
               buffer_size, allocation_, sparsity,
               /*buffer_identifier=*/tensor->buffer(),
               /*external_buffer_id=*/tensor->external_buffer()) != kTfLiteOk) {
-        TF_LITE_REPORT_ERROR(error_reporter_,
-                             "Tensor %d is invalidly specified in schema.\n",
-                             i);
         status = kTfLiteError;
       }
     } else {
       if (subgraph->SetTensorParametersReadWrite(
               i, type, get_name(tensor), dims, quantization, is_variable,
               dims_signature, tensor->external_buffer()) != kTfLiteOk) {
-        TF_LITE_REPORT_ERROR(error_reporter_,
-                             "Tensor %d is invalidly specified in schema.\n",
-                             i);
         status = kTfLiteError;
       }
     }
@@ -251,6 +225,10 @@ TfLiteStatus Subgraph::SetOutputs(std::vector<int> outputs) {
 1. `get_readonly_data()` 先解析模型字节。随后 `ParseQuantization()` 解析量化参数，`shape_signature` 单独读入；已知形状与允许动态调整的维度不是同一个字段。
 2. 有常量字节走 `SetTensorParametersReadOnly()`，传入字节范围、底层 Allocation、稀疏信息和 Buffer 标识。前面还会检查与 variable、external buffer 等组合是否兼容。
 3. 没有这段常量字节走 `SetTensorParametersReadWrite()`，登记形状、variable 和动态维度等描述。配置张量不等于所有数据已分配；继续到 `AllocateTensors()` 看 Prepare 和实际分配。
+
+这里的「只读」是 Runtime 按常量管理数据，不等于读取地址一定来自 `mmap`。一个容易漏掉的例外是：如果常量首地址不满足类型的对齐，`SetTensorParametersReadOnly()` 会复制到堆缓冲区，由 `aligned_ro_buffers_` 持有，并清掉原 `allocation` 关联；这条分支仍把 Tensor 标为 `kTfLiteMmapRo`。该快照还在尾部补 16 个零字节，配合 XNNPACK 的 SIMD 读取约定。要判断某个权重是否实际零拷贝，不能只看 allocation 类型，还得看指针和这个分支。[对齐与只读标记](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L2023-L2068)。
+
+可用「数据要活多久」来区分读写 Tensor：普通定长 Tensor 默认走 `kTfLiteArenaRw`；支持的定长 variable 走 `kTfLiteArenaRwPersistent`，不能像一步用完的中间结果那样复用它的存储；String / Resource / Variant 则另走动态分支。这里挑选的是分配策略，不是在 Builder 里已经给每个 Tensor 分配到最终地址。[读写分配分支](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L2112-L2133)。
 
 ### 4.2 量化：从文件参数变成运行时结构
 
@@ -270,31 +248,18 @@ Affine 分支检查参数个数、量化轴和 scale 个数与对应轴长度的
 源码节选：[interpreter_builder.cc:616–644](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L616-L644)、[interpreter_builder.cc:645–660](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L645-L660)。
 
 ```cpp
-  // Ensure that the quantization dimension is valid.
   if (src_quantization->quantized_dimension() < 0 ||
       (!dims.empty() &&
        src_quantization->quantized_dimension() >= dims.size())) {
-    TF_LITE_REPORT_ERROR(
-        error_reporter_,
-        "quantized_dimension must be in range [0, %d). Was %d.", dims.size(),
-        src_quantization->quantized_dimension());
     return kTfLiteError;
   }
 
-  // Ensure that the number of scales is 1 for per-layer quantization, and
-  // matches number of quantization dimensions for per-axis quantization.
   if (num_scales != 1 &&
       (!dims.empty() &&
        num_scales != dims[src_quantization->quantized_dimension()])) {
-    TF_LITE_REPORT_ERROR(
-        error_reporter_,
-        "num_scales must be 1 for per-layer quantization, or %d for per-axis "
-        "quantization, but got %d.",
-        dims[src_quantization->quantized_dimension()], num_scales);
     return kTfLiteError;
   }
 
-  // Affine-quantization.
   quantization->type = kTfLiteAffineQuantization;
   auto* affine_quantization = reinterpret_cast<TfLiteAffineQuantization*>(
       malloc(sizeof(TfLiteAffineQuantization)));
@@ -362,9 +327,6 @@ Affine 分支检查参数个数、量化轴和 scale 个数与对应轴长度的
   auto& node_and_reg = nodes_and_registration_.back();
   TfLiteNode& node = node_and_reg.first;
 
-  // NOTE, here we are not using move semantics yet, since our internal
-  // representation isn't std::vector, but in the future we would like to avoid
-  // copies, so we want the interface to take r-value references now.
   node.inputs = ConvertVectorToTfLiteIntArray(inputs);
   node.outputs = ConvertVectorToTfLiteIntArray(outputs);
   node.intermediates = ConvertVectorToTfLiteIntArray(intermediates);
@@ -380,6 +342,8 @@ Affine 分支检查参数个数、量化轴和 scale 个数与对应轴长度的
 1. `ParseNodes()` 根据注册项区分 builtin 和 custom。Builtin 的类型化配置由 `ParseOpData()` 放到 `builtin_data`；custom 则通常把原始字节作为 `init_data` 交给注册内核解释。
 2. 传给 `AddNodeWithParameters()` 的 `inputs/outputs/intermediates` 来自**当前算子**，不是 `Subgraph::inputs()/outputs()`。进入方法后转换成 `TfLiteIntArray` 保存到 Node 中。
 3. `OpInit()` 的结果放在 `node.user_data`，给同一个节点后续使用。`Registration` 提供要调用的实现；这里登记节点、可能调用 Init，但没有调用 Invoke 执行计算。
+
+有了 Tensor 和 Node 以后，Builder 还会扫一遍运行时 Tensor 表，把 `is_variable` 为真的编号收进 `SetVariables()`。这张表不是另一份输入列表：`inputs_` 回答「调用者喂什么」，`variables_` 回答「哪些 Tensor 是 Runtime 要跟踪的模型状态」。[收集变量索引](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L1122-L1129)。
 
 ## 6. 签名、默认委托与分配入口
 
@@ -408,17 +372,12 @@ Affine 分支检查参数个数、量化轴和 scale 个数与对应轴长度的
 
   if (TfLiteStatus status = ApplyDelegates(tmp_interpreter.get());
       status != kTfLiteOk) {
-    TF_LITE_REPORT_ERROR(error_reporter_, "Failed to apply delegates.\n");
     return status;
   }
 
 // ...
 
 TfLiteStatus Interpreter::AllocateTensors() {
-  // Apply the default delegate that TFLite will enable at this point to allow
-  // other user-level delegates to be applied first. Only returns error when
-  // the status is kTfLiteError. For other statuses, it will fall back to the
-  // default implementation.
   if (ApplyLazyDelegateProviders() == kTfLiteError) return kTfLiteError;
 
   return primary_subgraph().AllocateTensors();
@@ -430,6 +389,8 @@ TfLiteStatus Interpreter::AllocateTensors() {
 3. `AllocateTensors()` 的入口先尝试应用懒创建的默认委托，再由主子图分配。试验纯 builtin CPU 路径时，不能用「指定 CPU」代替关闭默认委托。
 
 ## 源码入口
+
+代码对照版本：LiteRT [`e3c11f0`](https://github.com/google-ai-edge/LiteRT/tree/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62)；片段中的 `// ...` 表示省略。
 
 - [LiteRT CompiledModel 中的 InterpreterBuilder 使用](https://github.com/google-ai-edge/LiteRT/blob/main/litert/runtime/compiled_model.cc)
 - [TensorFlow Lite InterpreterBuilder](https://github.com/tensorflow/tensorflow/blob/master/tensorflow/lite/core/interpreter_builder.cc)
