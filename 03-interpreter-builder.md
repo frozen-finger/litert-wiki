@@ -6,6 +6,8 @@
 
 先区分两条路径：上一篇的 `LiteRtModelT` 是 LiteRT 用于表示和处理模型的 IR；本篇的 `InterpreterBuilder` 读取的是 **TFLite FlatBuffer 视图**，不是直接把 `LiteRtModelT` 强转成 `Interpreter`。在 LiteRT 的 CompiledModel 实现里，可以到 `compiled_model.cc` 查找 `tflite::InterpreterBuilder` 的实际调用点；上游版本和编译开关不同，转换步骤、构造参数或支持的特性也可能不同。
 
+按原稿逐段跟代码，见[第六篇：InterpreterBuilder 源码精读](06-interpreter-builder-source.md)。
+
 ## 1. 从 Builder 到 Interpreter
 
 ```cpp

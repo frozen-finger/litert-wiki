@@ -4,6 +4,8 @@
 
 知道模型里有一个 ABS，不等于运行时已经知道怎样求绝对值；知道环境里有 XNNPACK，也不等于 ABS 一定会交给它。本篇顺着两条线看：一条是 **Resolver 为原节点找实现**，另一条是 **Delegate 把满足条件的一部分原节点换成新的执行节点**。这里讨论的是 `tflite/` 下的 Interpreter 路径，不是直接对上一篇模型 IR 调用这些方法。节选以原稿的接口形态为主，宏、默认委托、支持条件和错误处理应以手头的 checkout 为准。
 
+逐段跟读见[第七篇：Resolver、ABS 与 XNNPACK 创建](07-resolver-kernel-source.md)和[第八篇：Prepare 与图改写](08-prepare-delegate-source.md)。
+
 ## 1. 从 `OpResolver` 查到 `TfLiteRegistration`
 
 | 需要回答的问题 | 对象 |

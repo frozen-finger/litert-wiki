@@ -23,6 +23,16 @@
 - [PrepareOpsStartingAt](04-resolver-delegate.md#511-prepareopsstartingat循环一项一项看)：执行计划索引、动态输出暂停，以及后续怎样继续。
 - [分区边界](04-resolver-delegate.md#分区边界怎样从依赖关系算出来)：候选节点可以接管不等于可以合并。
 
+### 逐段源码精读
+
+前五篇便于先了解调用关系。下面三篇以原始 Interpreter 笔记的顺序整理，保留原有代码与逐步理解；较长的代码块可以展开。
+
+| 篇目 | 跟读路线 |
+| --- | --- |
+| [六、InterpreterBuilder](06-interpreter-builder-source.md) | 构造与注册映射 → 子图 → Tensor 与量化 → Node → Signature 与显式委托 |
+| [七、Resolver、ABS 与 XNNPACK 创建](07-resolver-kernel-source.md) | Resolver 注册 → 生命周期回调 → ABS/Resize → 委托工厂、线程池和权重缓存 |
+| [八、Prepare 与 Delegate 图改写](08-prepare-delegate-source.md) | 逐节点准备与动态尺寸 → XNNPACK 选点和预展开 → 分区、代理节点及执行计划 |
+
 ## 图例与本地阅读
 
 - **归属、持有**：蓝绿色实线。
