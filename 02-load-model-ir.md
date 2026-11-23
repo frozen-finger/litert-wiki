@@ -100,16 +100,12 @@ Expected<FlatbufferWrapper::Ptr> FlatbufferWrapper::CreateFromAllocation(
 
 #### 从文件入口跟到校验分支
 
-源码节选：[flatbuffer_tools.cc:332–338](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/util/flatbuffer_tools.cc#L332-L338)。
+实际源码：[flatbuffer_tools.cc:332–338](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/util/flatbuffer_tools.cc#L332-L338)。
 
-```cpp
-Expected<FlatbufferWrapper::Ptr> FlatbufferWrapper::CreateFromTflFile(
-    absl::string_view path, bool allow_modifications) {
-  auto error_reporter = tflite::DefaultErrorReporter();
-  auto allocation = tflite::GetAllocationFromFile(path.data(), error_reporter,
-                                                  allow_modifications);
-  return FlatbufferWrapper::CreateFromAllocation(std::move(allocation));
-}
+```text
+CreateFromTflFile(path, allow_changes):
+    allocation = GetAllocationFromFile(path, reporter, allow_changes)
+    return CreateFromAllocation(move(allocation))
 ```
 
 1. 从 `CreateFromTflFile()` 开始：`GetAllocationFromFile()` 返回可访问的字节区域，`allow_modifications` 传递给底层 I/O 策略，不是在这里修改计算图。
@@ -190,22 +186,13 @@ StoredBufferManager buffer_manager_ = std::make_unique<BufferManager>();
 
 #### 把模型和子图里的两层循环连起来
 
-源码节选：[model_load.cc:612–624](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L612-L624)。
+实际源码：[model_load.cc:612–624](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L612-L624)。
 
-```cpp
-  const auto* packed_model = context.PackedModel();
-
-  if (packed_model->subgraphs()) {
-    const auto num_subgraphs = packed_model->subgraphs()->size();
-    for (auto i = 0; i < num_subgraphs; ++i) {
-      const auto* tfl_subgraph = packed_model->subgraphs()->Get(i);
-      if (tfl_subgraph == nullptr) {
-        return Error(kLiteRtStatusErrorInvalidFlatbuffer);
-      }
-      LITERT_RETURN_IF_ERROR(UnpackSubgraph(context, *tfl_subgraph,
-                                            litert_model->EmplaceSubgraph()));
-    }
-  }
+```text
+for each serialized_subgraph in packed_model:
+    require serialized_subgraph != null
+    destination = ir_model.EmplaceSubgraph()
+    propagate UnpackSubgraph(context, serialized_subgraph, destination)
 ```
 
 1. 外层每读到一个文件子图，就用 `EmplaceSubgraph()` 建一个 IR 子图，再传给 `UnpackSubgraph()`。这里还没有创建 Interpreter。
@@ -331,31 +318,16 @@ if (buffer_ind != 0) {
 
 #### `ReadBuffer()` 怎样选中字节来源
 
-源码节选：[model_load.cc:285–312](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L285-L312)。
+实际源码：[model_load.cc:285–312](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L285-L312)。
 
-```cpp
-  const auto& tfl_buffer = **buffer;
-
-  if (tfl_buffer.offset() != 0) {
-
-    const auto* alloc_base = context.AllocBase();
-    const auto offset = tfl_buffer.offset();
-    const auto size = tfl_buffer.size();
-    if (!IsRangeInAllocation(offset, size, context.AllocSize())) {
-      return Error(kLiteRtStatusErrorInvalidFlatbuffer);
-    }
-
-    return TflBufferContext{BufferRef<uint8_t>(alloc_base + offset, size),
-                            true};
-  } else if (tfl_buffer.data()) {
-
-    const auto* start = tfl_buffer.data()->data();
-    const auto size = tfl_buffer.data()->size();
-
-    return TflBufferContext{BufferRef<uint8_t>(start, size), false};
-  } else {
-    return TflBufferContext{};
-  }
+```text
+buffer = 查模型级 Buffer 表，找不到则返回错误
+if buffer.offset != 0:
+    验证 [offset, offset + size) 落在整个 Allocation 里
+    return 追加区的非拥有字节视图，标记为应追加
+if buffer.data 存在:
+    return data 向量内的非拥有字节视图，不标记追加
+return 空视图
 ```
 
 1. `GetTflBuffer()` 先用文件下标定位 `Buffer`。非零 `offset` 优先，`IsRangeInAllocation()` 检查模型 Allocation 的范围后才能按偏移取字节。
@@ -383,6 +355,12 @@ SetWeightsFromUnownedBuffer(
 ```
 
 这里保存的是外部权重的 **ID / Group / Offset / Length / Packing 等元数据**；传入的 `BufferRef` 为空，说明这段模型加载代码没有立即获取独立权重文件中的有效数据指针。这是 `UnpackTensor()` **这一阶段**的行为。较新的文件入口（[外部权重组加载变更](https://github.com/google-ai-edge/LiteRT/commit/a420b1bbfddea3d0681c0b3a9afa3e3d3e43e04b)）在 `UnpackModel()` 之后还会尝试打开权重组文件：组名为相对路径时相对模型目录解析；同组只尝试打开一次，可读时检查权重范围并将对应字节放入拥有数据的 Buffer；不可读时保留空视图，仍可由运行时选项提供权重源。这个补充属于文件入口，不应外推到所有内存加载入口。
+
+#### 用两张 Tensor 共用一份权重把 ID 对上
+
+比如 T1 和 T5 的 `Tensor.buffer` 都是 7。第一次解析时查文件 `Model.buffers[7]`，借用其字节并登记一个内部 ID，例如 12；第二次查到映射就让 T5 也使用 12。这里同时出现三类编号：T1/T5 是**子图内 Tensor** 的下标，7 是**文件级 Buffer** 下标，12 是 **BufferManager** 的内部句柄。
+
+若文件把 7 放在 `Tensor.external_buffer` 而不是 `Tensor.buffer`，查的是外部权重引用，按另一张表去重。该分支先保留 group、offset、length 和 packing，并不把外部文件字节当作内嵌常量立即读进来。这样就能把「加载得到权重引用」和「后续解析或绑定了权重字节」区分开。
 
 ### 4.4 Buffer 所有权与生命周期
 
@@ -538,31 +516,16 @@ T1 ──input──▶ Op0
 
 #### 顺着 `UnpackOp()` 看一条输入边
 
-源码节选：[model_load.cc:207–234](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L207-L234)。
+实际源码：[model_load.cc:207–234](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L207-L234)。
 
-```cpp
-  const auto num_inputs = tfl_op.inputs() ? tfl_op.inputs()->size() : 0;
-  for (auto i = 0; i < num_inputs; ++i) {
-    const auto input_ind = tfl_op.inputs()->Get(i);
-    if (input_ind == -1) {
-      continue;
-    }
-    if (input_ind < 0 ||
-        static_cast<size_t>(input_ind) >= parent.Tensors().size()) {
-      return kLiteRtStatusErrorInvalidFlatbuffer;
-    }
-    AttachInput(&parent.Tensor(input_ind), litert_op);
-  }
-
-  const auto num_outputs = tfl_op.outputs() ? tfl_op.outputs()->size() : 0;
-  for (auto i = 0; i < num_outputs; ++i) {
-    const auto output_ind = tfl_op.outputs()->Get(i);
-    if (output_ind < 0 ||
-        static_cast<size_t>(output_ind) >= parent.Tensors().size()) {
-      return kLiteRtStatusErrorInvalidFlatbuffer;
-    }
-    AttachOutput(&parent.Tensor(output_ind), litert_op);
-  }
+```text
+for id in serialized_op.inputs:
+    if id == -1: continue
+    require id 在子图 Tensor 表范围内
+    把表中该 Tensor 接到当前 Op 的输入端，并登记消费者
+for id in serialized_op.outputs:
+    require id 在子图 Tensor 表范围内
+    把表中该 Tensor 接到当前 Op 的输出端，并登记生产者
 ```
 
 1. 沿文件中的输入列表逐项取下标。可选输入的 `-1` 先跳过，不按负数索引访问 Tensor 表。
@@ -632,34 +595,19 @@ litert_subgraph.Outputs().push_back(
 
 其中部分对象先调用 FlatBuffers 生成的 `UnPack()`，再转为 LiteRT 的内部表示。不能把这些信息都概括为“简单读取，无额外处理”，例如 Signature 解包还包含索引与数量校验。
 
+原稿把 Signature 单列出来很有用，因为它和逐算子解包不一样：先核对目标子图及 I/O 数量，再用每项的 Tensor 编号处理别名，最后按子图 I/O 顺序组织列表。比如文件子图的输入是 `[T3,T7]`，具名记录先写 `rhs → T7`、再写 `lhs → T3`，整理后的名字顺序仍是 `[lhs,rhs]`。一个入口由 key 找到对应子图；参数名是入口的名字，既不是张量编号，也不是文件向量恰好出现的位置。对照无显式签名时的默认入口，见 [UnpackSignatures 与 fallback](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L518-L646)。
+
 #### 按子图顺序整理 Signature 的别名
 
-源码节选：[model_load.cc:574–597](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L574-L597)。
+实际源码：[model_load.cc:574–597](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L574-L597)。
 
-```cpp
-    std::vector<std::string> input_names;
-    std::vector<LiteRtTensor> input_tensors;
-    input_names.reserve(tfl_inputs.size());
-    for (auto& tensor : litert_subgraph->Inputs()) {
-      input_names.push_back(input_aliases.contains(tensor)
-                                ? input_aliases.at(tensor)
-                                : std::string(tensor->Name()));
-      input_tensors.push_back(tensor);
-    }
-    std::vector<std::string> output_names;
-    std::vector<LiteRtTensor> output_tensors;
-    output_names.reserve(tfl_outputs.size());
-    for (auto& tensor : litert_subgraph->Outputs()) {
-      output_names.push_back(output_aliases.contains(tensor)
-                                 ? output_aliases.at(tensor)
-                                 : std::string(tensor->Name()));
-      output_tensors.push_back(tensor);
-    }
-
-    parent.EmplaceSignature(litert_subgraph, std::move(input_names),
-                            std::move(input_tensors), std::move(output_names),
-                            std::move(output_tensors),
-                            tfl_signature->signature_key);
+```text
+先按文件中的 Tensor 编号建立 张量 → 别名 的映射
+for each role in [input, output]:
+    for tensor in 子图公开列表[role]:
+        追加已有张量引用
+        追加别名；没有别名时用张量本身名称
+在同一个 Signature 中保存这些有序列表以及子图与 signature key
 ```
 
 1. 前面先根据 Signature 的 Tensor 索引在所属子图定位对象，建立 `Tensor → 名称` 的表。
@@ -716,24 +664,16 @@ struct DispatchOpOptions {
 
 #### Dispatch Op 怎样找到已有的 Bytecode
 
-源码节选：[model_load.cc:742–761](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L742-L761)。
+实际源码：[model_load.cc:742–761](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L742-L761)。
 
-```cpp
-          if (!IsRangeInAllocation(dispatch_opts.bytecode_offset,
-                                   dispatch_opts.bytecode_size,
-                                   allocation_size)) {
-            return Error(kLiteRtStatusErrorInvalidFlatbuffer);
-          }
-          BufferRef<uint8_t> byte_code(
-              model_flatbuffer.AllocBase() + dispatch_opts.bytecode_offset,
-              dispatch_opts.bytecode_size);
-          const BufferManager::BufferId buf_id =
-              model->Buffers()->RegisterNonOwnedBuffer(byte_code);
-          buffer_id_map.insert({dispatch_opts.bytecode_offset, buf_id});
-        }
-
-        model->AttachAssetToOp(op, buffer_id_map[dispatch_opts.bytecode_offset],
-                               std::move(dispatch_opts.name));
+```text
+for dispatch in 已识别的 Dispatch Op:
+    offset, size, entry = 读取选项
+    if offset 未登记:
+        检查该范围没有越过 Allocation
+        bytes = 借用模型中 [offset, offset + size) 的字节
+        把 BufferManager 登记的 ID 记入 offset → ID 表
+    为 dispatch 挂上表中的 ID 和 entry
 ```
 
 1. 进入这段之前已经根据 custom code 识别了 Dispatch Op，并从其选项取出 `offset`、`size` 和名称。副本 ID 表以偏移为键，只在还没登记该偏移时进入范围检查与注册。

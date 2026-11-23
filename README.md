@@ -14,7 +14,14 @@
 
 第一篇的格式知识两条路径通用；第二篇跟的是 LiteRT 模型加载到 IR 的路径，第三、四篇跟的是 TFLite 兼容 C++ Interpreter 路径。它们共用模型格式和部分底层实现，但 `LiteRtModelT → InterpreterBuilder` 不是这两份源码的直接调用链。第一次读可以先看第一篇，再对照第五篇的小图回到各自的实现。
 
-文中带 `...` 的代码是为讲清当前调用链而节选，适合与各篇列出的源码一起核对。阅读其他版本时，优先查同名入口和职责，再对照具体参数或分支。
+流程块按源码分支和调用顺序整理，行号链接可以直接打开对应版本的实现。遇到代码与其他版本不同，先确认你走的是 LiteRT Loader 还是 Interpreter，再查同名入口的参数和分支。
+
+**按问题跳读**
+
+- [模型权重与 Buffer ID](02-load-model-ir.md#用两张-tensor-共用一份权重把-id-对上)：文件索引、内部句柄和外部权重分别从哪里来。
+- [Interpreter 的 I/O](03-interpreter-builder.md#inputs--outputs-是怎样填进去的)：从文件中的两个列表到运行时 Tensor 访问。
+- [PrepareOpsStartingAt](04-resolver-delegate.md#511-prepareopsstartingat循环一项一项看)：执行计划索引、动态输出暂停，以及后续怎样继续。
+- [分区边界](04-resolver-delegate.md#分区边界怎样从依赖关系算出来)：候选节点可以接管不等于可以合并。
 
 ## 图例与本地阅读
 

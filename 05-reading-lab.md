@@ -51,7 +51,7 @@ return z && z[0] == 4.0f && z[1] == 6.0f ? 0 : 6;
 按源码断点来读：
 
 1. **Builder 建图。** 在 `BuildLocalIndexToRegistrationMapping` 看 `opcode_index` 如何查到 `ADD` 注册项；然后看节点的张量索引如何传给子图。到这里已经知道执行的是哪个节点，但还没有写入本次输入。
-2. **AllocateTensors 准备。** 跟踪子图的 `PrepareOpsAndTensors` 与注册项的 `prepare` 回调。对于静态的示例，可以在这一步之后看输入输出的内存；有动态 shape 的模型，某些输出只能在执行时确定，因此不能用本例推断所有 tensor 都已分配。用 `ResizeInputTensor` 改形状后，要按 API 要求重新分配并重新取得指针。
+2. **AllocateTensors 准备。** 跟踪子图的 `PrepareOpsAndTensors` 与注册项的 `prepare` 回调。对于静态的示例，可以在这一步之后看输入输出的内存；有动态 shape 的模型，某些输出只能在执行时确定，因此不能用本例推断所有 tensor 都已分配。用 `ResizeInputTensor` 改形状后，要按 API 要求重新分配并重新取得指针。若换一个输出尺寸由输入数据决定的模型，可以跟进 [Prepare 的暂停点与 Invoke 续跑](04-resolver-delegate.md#513-从-allocatetensors-暂停再从-invoke-继续)，分别观察准备位置、动态 Tensor 编号和分配位置。上面的静态 ADD 不会触发这个分支。
 3. **Invoke 执行。** 进入 `Subgraph::Invoke` 后看实际执行计划。未委托的节点会走注册项对应的执行回调；如果默认或显式 Delegate 已接管节点，就可能经过 Delegate 节点。从主线找不到 builtin ADD 的调用时，先确认当前执行计划，而不是先怀疑 ADD 没有运行。
 
 做对照实验时要记录是否启用了默认 Delegate。以 TensorFlow v2.20.0 的相应 C++ API 为例，可用 `tflite::ops::builtin::BuiltinOpResolverWithoutDefaultDelegates` 代替上面的 resolver，同时不要显式添加 Delegate，再观察 builtin 路径。这和只指定 CPU 不是一回事：CPU 也可以运行委托后端。示例把 `model` 和 `resolver` 都保留到 Interpreter 使用结束，避免把模型字节的生命周期问题和执行错误混在一起。

@@ -51,35 +51,17 @@ if (builder(&interpreter) != kTfLiteOk || !interpreter) {
 
 ### 注册表：从 opcode 索引到指针
 
-源码节选：[interpreter_builder.cc:263–293](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L263-L293)。
+实际源码：[interpreter_builder.cc:263–293](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L263-L293)。
 
-```cpp
-  int num_custom_ops = 0;
-  for (const OperatorCode* opcode : *opcodes) {
-    if (GetBuiltinCode(opcode) == BuiltinOperator_CUSTOM) {
-      num_custom_ops++;
-    }
-  }
-  unresolved_custom_ops_.reserve(num_custom_ops);
-  for (const OperatorCode* opcode : *opcodes) {
-    const TfLiteRegistration* registration = nullptr;
-    status = GetRegistrationFromOpCode(opcode, op_resolver_, error_reporter_,
-                                       &registration);
-    if (status != kTfLiteOk) {
-      if (GetBuiltinCode(opcode) != BuiltinOperator_CUSTOM) {
-        return status;
-      }
-      if (!opcode->custom_code()) {
-        return status;
-      }
-      const auto* op_name = opcode->custom_code()->c_str();
-      unresolved_custom_ops_.push_back(CreateUnresolvedCustomOp(op_name));
-      registration = &unresolved_custom_ops_.back();
-      has_flex_op_ |= IsFlexOp(op_name);
-      status = kTfLiteOk;
-    }
-    flatbuffer_op_index_to_registration_.push_back(registration);
-  }
+```text
+预留 CUSTOM 占位记录的空间
+for opcode in 文件的 operator_codes:
+    registration = 按类型或名称、版本查 resolver
+    if 没找到:
+        if 不是带名称的 CUSTOM: 结束构建并报错
+        registration = 保存占位记录并取得其地址
+        识别可能需要 Flex 的节点
+    映射表追加 registration，保持原始下标
 ```
 
 1. 先统计 CUSTOM 项并预留占位注册表空间。因为后一张表将存储占位对象的地址，不能边扩容边任由旧地址失效。
@@ -104,59 +86,33 @@ Interpreter 初始化第 0 个 Subgraph；Builder 为序列化子图补齐运行
 
 构图也可挂性能采集：`MaybeCreatePlatformProfiler` 是否产生 profiler 取决于平台、编译配置和实现；例如 Android 的 atrace 或 Apple 的 signpost，不能假定每个构建都同时提供同一套采集器。Telemetry profiler 是另一条接收事件的路径，可与平台 profiler 并存；未提供就不应期待出现对应遥测。部分版本会在构图时为遥测记录子图的张量量化信息。
 
+### 3.1 一个共享 Context 和每个子图各自的 Context 不是一回事
+
+原稿列出的七个构造参数可以带着所有权来看：`error_reporter`、外部 Context 数组、Interpreter 的子图表、资源对象表、资源名到 ID 的表、初始化状态表，都由 Interpreter 统一管理并传给子图；最后一项是子图自身的编号。每个子图另外持有自己的 `TfLiteContext`，其中 `impl_` 回指**该**子图。主图的 Context 同时被 Interpreter 的普通接口用作默认 Context，并不意味着其他子图共用它。
+
+跟读时可以先在第 0 张图的构造函数看这一组引用，再在 `AddSubgraphs` 看其余图如何沿用这些参数、但各自建立 Context。设置线程数要在子图创建之后；`-1` 是未指定建议值，不是线程池大小。Profiler 也有两路：平台 profiler 由构建选项和平台选择，调用方提供的 Telemetry profiler 是额外附加，不是替换前者。描述对象或包装器创建完成，也不意味着 CPU 线程池已经就绪。
+
+[Interpreter 创建子图](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter.cc#L199-L215) · [Builder 配置和导入](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L989-L1024)
+
 ## 4. ParseTensors：从描述到运行时张量
 
 先 `AddTensors` 建张量槽位并让 Context 能定位它们，再设图的输入、输出索引，最后逐个配置这些槽位。AddTensors 扩的是 `TfLiteTensor` 描述对象数组，不等于为所有张量的数据分配内存。Builder 把 schema 的 `TensorType` 映射到运行时 `TfLiteType`（例如 `INT32 → kTfLiteInt32`），并统计浮点张量，供后面的默认委托工厂判断。
 
 #### `inputs()` / `outputs()` 是怎样填进去的
 
-源码节选：[interpreter_builder.cc:1105–1111](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L1105-L1111)、[subgraph.cc:894–906](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L894-L906)、[interpreter.h:247–259](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter.h#L247-L259)、[interpreter.h:491–494](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter.h#L491-L494)、[interpreter.h:535–538](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter.h#L535-L538)。
+实际源码：[interpreter_builder.cc:1105–1111](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L1105-L1111)、[subgraph.cc:894–906](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L894-L906)、[interpreter.h:247–259](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter.h#L247-L259)、[interpreter.h:491–494](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter.h#L491-L494)、[interpreter.h:535–538](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter.h#L535-L538)。
 
-```cpp
-  if (modified_subgraph->AddTensors(tensors->size()) != kTfLiteOk) {
-    return kTfLiteError;
-  }
-  modified_subgraph->SetInputs(FlatBufferIntArrayToVector(subgraph->inputs()));
-  modified_subgraph->SetOutputs(
-      FlatBufferIntArrayToVector(subgraph->outputs()));
+```text
+Builder:
+    AddTensors(文件子图的 tensor 数量)
+    依文件声明的顺序复制 inputs、outputs 两个整数列表
+    交给运行时子图；SetInputs/SetOutputs 检查下标后接管列表
+    ParseTensors() → ParseNodes()
 
-// ...
-
-TfLiteStatus Subgraph::SetInputs(std::vector<int> inputs) {
-  TF_LITE_ENSURE_OK(&context_,
-                    CheckTensorIndices("inputs", inputs.data(), inputs.size()));
-  inputs_ = std::move(inputs);
-  return kTfLiteOk;
-}
-
-TfLiteStatus Subgraph::SetOutputs(std::vector<int> outputs) {
-  TF_LITE_ENSURE_OK(
-      &context_, CheckTensorIndices("outputs", outputs.data(), outputs.size()));
-  outputs_ = std::move(outputs);
-  return kTfLiteOk;
-}
-
-// ...
-
-  const std::vector<int>& inputs() const { return primary_subgraph().inputs(); }
-
-  const std::vector<int>& outputs() const {
-    return primary_subgraph().outputs();
-  }
-
-// ...
-
-  template <class T>
-  T* typed_input_tensor(int index) {
-    return typed_tensor<T>(inputs()[index]);
-  }
-
-// ...
-
-  template <class T>
-  T* typed_output_tensor(int index) {
-    return typed_tensor<T>(outputs()[index]);
-  }
+Interpreter:
+    inputs() / outputs() → 主子图的两个列表
+    typed_input_tensor<T>(i) → typed_tensor<T>(主图输入列表[i])
+    typed_output_tensor<T>(i) → typed_tensor<T>(主图输出列表[i])
 ```
 
 1. Builder 先 `AddTensors()` 建好运行时槽位，再把 FlatBuffer `SubGraph.inputs()` 和 `outputs()` 按原顺序各拷进一个 `std::vector<int>`。转换函数 [见源码](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L298-L310)：空指针转为空列表，其他情况逐项 `Get(i)`。
@@ -180,46 +136,23 @@ TfLiteStatus Subgraph::SetOutputs(std::vector<int> outputs) {
 
 普通密集常量会核对理论字节数不大于实际 Buffer；字符串、Resource、Variant、稀疏和外部数据不能套同一公式。
 
+**常量地址是怎样找到的。** 在 [`ParseTensors()` 里面的 `get_readonly_data`](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L800-L834) 单独跟一遍：先把数据指针置空，编号 0 不取常量；其余编号查的是**模型级** Buffer 表，不是子图的 Tensor 表。此处优先用 `Buffer.data`；没有内嵌向量，才在 `offset > 1` 且有 Allocation 时尝试同文件追加区，用 `size <= 总长 - offset` 防止越界。第二篇 LiteRT Loader 的 `ReadBuffer()` 则优先判断非零 offset。两条路径不要合写成一段规则。
+
+`shape` 给出当前形状，例如 `[1, 224, 224, 3]`；`shape_signature=[-1,224,224,3]` 说明 batch 维允许调整。两者一起看才能解释为什么刚加载有一个明确大小，之后还可以 Resize。解析过程中统计 FP32 Tensor 数还有一个后续用途：决定是否登记 lazy Delegate 工厂，计数不是 XNNPACK 的逐节点支持结果。
+
 #### `ParseTensors()` 为什么分读写两条路
 
-源码节选：[interpreter_builder.cc:835–854](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L835-L854)、[interpreter_builder.cc:873–894](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L873-L894)。
+实际源码：[interpreter_builder.cc:835–854](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L835-L854)、[interpreter_builder.cc:873–894](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L873-L894)。
 
-```cpp
-    size_t buffer_size = 0;
-    const char* buffer_ptr = nullptr;
-    TF_LITE_ENSURE_STATUS(get_readonly_data(&buffer_ptr, &buffer_size));
-
-    const auto* src_quantization = tensor->quantization();
-    TfLiteQuantization quantization{};
-    if (ParseQuantization(src_quantization, &quantization, dims,
-                          tensors->size()) != kTfLiteOk) {
-      status = kTfLiteError;
-    }
-
-    std::vector<int> dims_signature = {};
-    if (tensor->shape_signature()) {
-      dims_signature = FlatBufferIntArrayToVector(tensor->shape_signature());
-    }
-
-    bool is_variable = tensor->is_variable();
-
-// ...
-
-      if (subgraph->SetTensorParametersReadOnly(
-              i, type, get_name(tensor), dims, quantization, buffer_ptr,
-              buffer_size, allocation_, sparsity,
-              /*buffer_identifier=*/tensor->buffer(),
-              /*external_buffer_id=*/tensor->external_buffer()) != kTfLiteOk) {
-        status = kTfLiteError;
-      }
-    } else {
-      if (subgraph->SetTensorParametersReadWrite(
-              i, type, get_name(tensor), dims, quantization, is_variable,
-              dims_signature, tensor->external_buffer()) != kTfLiteOk) {
-        status = kTfLiteError;
-      }
-    }
-  }
+```text
+读取可能存在的常量地址和大小
+解析量化参数与 shape_signature
+if 有常量地址:
+    核对 variable 和 external buffer 的限制
+    解析稀疏元数据；配置只读描述和原始 Allocation
+else:
+    配置读写描述，并记录 variable、shape_signature 和外部 Buffer ID
+遇到无效参数时记录构建错误
 ```
 
 1. `get_readonly_data()` 先解析模型字节。随后 `ParseQuantization()` 解析量化参数，`shape_signature` 单独读入；已知形状与允许动态调整的维度不是同一个字段。
@@ -243,46 +176,31 @@ TfLiteStatus Subgraph::SetOutputs(std::vector<int> outputs) {
 
 Affine 分支检查参数个数、量化轴和 scale 个数与对应轴长度的关系。实验选项打开时，如果 zero point 全部相同，运行时可只保留一个值；读取方必须识别这种表示，尤其是自定义或外部 Delegate。Blockwise/MultiAxis 的 scale 和 zero point 可通过子图内的 Tensor 索引引用而非直接存成数组，可选引用可能用 `-1`。检查索引有效不代表每个内核都接受这种类型或布局；还须看 Prepare 与硬件后端的支持。量化格式详见[第一篇](01-model-format.md)。
 
+#### 先看 MultiAxis 和 Blockwise，再看普通仿射
+
+[MultiAxis 校验与参数对象](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L411-L502) · [Blockwise 两套运行时结构](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L504-L577)
+
+| 分支 | 先检查什么 | 最终写入什么 |
+| --- | --- | --- |
+| 无量化描述 | 无描述时直接沿默认类型返回 | `kTfLiteNoQuantization`、空参数 |
+| MultiAxis | Scale Tensor 编号必须有效；可选的 zero-point Tensor 允许用 `-1`；block size 不能为负；维度列表不能为空，逐项核对轴编号 | `TfLiteMultiAxisQuantization` 保存两个 Tensor 编号、block size 和复制后的轴列表。语义可覆盖多个轴，不要把语义写成这里强制至少两个轴。 |
+| Blockwise V2 | 非空 `block_shape` 优先；已知 rank 时长度须与 rank 相符，每项必须大于零；有问题时报错，不退回 V1 | `TfLiteBlockwiseQuantizationV2` 保存比例/零点 Tensor 编号、量化维度、旧 block size 字段与 block shape。 |
+| Blockwise V1 | 没有非空 `block_shape` 才走旧路径 | 保存比例/零点编号、量化维度和 block size。 |
+| 普通仿射 | 不属于以上分支才读通用 scale/zero-point 列表 | 详见下面按单 tensor 或单轴量化的检查。 |
+
+原稿这里的重点是 **MultiAxis / Blockwise 的 scale 字段可以是另一张 Tensor 的编号，而普通仿射是在读数值数组**。看到最后统一通过 `void*` 保存参数，不代表它们的内部布局相同；读者要先检查量化类型再转成对应结构。
+
 #### 普通仿射量化的两类检查
 
-源码节选：[interpreter_builder.cc:616–644](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L616-L644)、[interpreter_builder.cc:645–660](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L645-L660)。
+实际源码：[interpreter_builder.cc:616–644](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L616-L644)、[interpreter_builder.cc:645–660](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L645-L660)。
 
-```cpp
-  if (src_quantization->quantized_dimension() < 0 ||
-      (!dims.empty() &&
-       src_quantization->quantized_dimension() >= dims.size())) {
-    return kTfLiteError;
-  }
-
-  if (num_scales != 1 &&
-      (!dims.empty() &&
-       num_scales != dims[src_quantization->quantized_dimension()])) {
-    return kTfLiteError;
-  }
-
-  quantization->type = kTfLiteAffineQuantization;
-  auto* affine_quantization = reinterpret_cast<TfLiteAffineQuantization*>(
-      malloc(sizeof(TfLiteAffineQuantization)));
-  affine_quantization->scale = TfLiteFloatArrayCreate(num_scales);
-
-// ...
-
-  for (size_t i = 0; i < num_scales; ++i) {
-    affine_quantization->scale->data[i] = src_quantization->scale()->Get(i);
-  }
-  if (all_zero_points_same) {
-    affine_quantization->zero_point = TfLiteIntArrayCreate(1);
-    affine_quantization->zero_point->data[0] = zero_point;
-  } else {
-    affine_quantization->zero_point = TfLiteIntArrayCreate(num_scales);
-    for (size_t i = 0; i < num_scales; ++i) {
-      affine_quantization->zero_point->data[i] =
-          src_quantization->zero_point()->Get(i);
-    }
-  }
-  affine_quantization->quantized_dimension =
-      src_quantization->quantized_dimension();
-  quantization->params = reinterpret_cast<void*>(affine_quantization);
+```text
+对普通仿射量化参数检查：
+    quantized_dimension 不得为负；已知维度时不得越界
+    scale.size 不是 1 时，已知维度下必须等于选定轴的长度
+    复制 scales；zero points 按原值保存
+    压缩选项启用且值全相同时，可只存一个 zero point
+    保存量化种类、参数对象和轴编号
 ```
 
 1. 先检查 `quantized_dimension`，再比较 `scale` 的个数：有可用的维度信息时，多个 scale 要对应所选轴的长度；单个 scale 表示整张量使用一套比例。
@@ -294,6 +212,8 @@ Affine 分支检查参数个数、量化轴和 scale 个数与对应轴长度的
 `ParseSparsity` 处理的是“权重值以压缩形式保存，怎么找回坐标”。`traversal_order` 指定遍历维度顺序；分块时附加块内维度，`block_map` 把这些维度映射回原张量轴。`dim_metadata` 逐层描述 DENSE（坐标全存在，按 dense size 遍历）或 SPARSE_CSR（按 segments 划出每个父位置对应的 indices 范围）。例如一层的 `segments=[0, 2, 3]` 与 `indices=[1, 3, 2]`，表示第一个父位置下有坐标 1、3，第二个父位置下有坐标 2。索引序列可有 8、16、32 位编码，原稿的解析器统一转为 `TfLiteIntArray`。这里没有把稀疏权重展开成密集矩阵；运行时保有压缩值和元数据。原稿路径的稀疏导入用于固定数据，不应假设可写路径能接受同样的 sparsity 参数。
 
 量化结构和稀疏元数据由临时 RAII 封装而不是因为“局部变量不能 delete”。这类结构内部可能有单独申请的内存；只有在所有权成功交接时才 `release`，失败路径让相应 deleter 清理，模型字节借用与这些结构的所有权不能混为一谈。
+
+从 [`ParseSparsity()`](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L664-L729) 往回看，`traversal_order` 是遍历顺序，`block_map` 是**块内维度与原维度的对应表**，各维的 `dim_metadata` 则回答「这一维怎么编码」。Dense 只保存大小；CSR 分别保存 segments（每个父位置的索引区间）与 indices（实际出现的子坐标）。例如 segments=[0,2,3]、indices=[1,4,2]，表示第一个父位置有子坐标 1、4，第二个只有 2，不是三项数据值。[稀疏索引的类型转换](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L105-L158)把 UInt8、UInt16 或 Int32 的编码整理为运行时的 `TfLiteIntArray`。Builder 解析的是已有压缩描述；这段不会现场删掉零元素。
 
 ## 5. ParseNodes：把张量索引和算子实现接起来
 
@@ -308,35 +228,16 @@ Affine 分支检查参数个数、量化轴和 scale 个数与对应轴长度的
 
 ### 节点创建时哪些数据已经落到 `TfLiteNode`
 
-源码节选：[interpreter_builder.cc:396–405](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L396-L405)、[subgraph.cc:1196–1211](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L1196-L1211)。
+实际源码：[interpreter_builder.cc:396–405](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L396-L405)、[subgraph.cc:1196–1211](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L1196-L1211)。
 
-```cpp
-    } else {
-      MallocDataAllocator malloc_allocator;
-      TF_LITE_ENSURE_STATUS(ParseOpData(op, op_type, error_reporter_,
-                                        &malloc_allocator, &builtin_data));
-    }
-    subgraph->AddNodeWithParameters(
-        FlatBufferIntArrayToVector(op->inputs()),
-        FlatBufferIntArrayToVector(op->outputs()),
-        FlatBufferIntArrayToVector(op->intermediates()), init_data,
-        init_data_size, builtin_data, registration);
-
-// ...
-
-  auto& node_and_reg = nodes_and_registration_.back();
-  TfLiteNode& node = node_and_reg.first;
-
-  node.inputs = ConvertVectorToTfLiteIntArray(inputs);
-  node.outputs = ConvertVectorToTfLiteIntArray(outputs);
-  node.intermediates = ConvertVectorToTfLiteIntArray(intermediates);
-  node.temporaries = TfLiteIntArrayCreate(0);
-  if (init_data) {
-    node.user_data = OpInit(*registration, init_data, init_data_size);
-  } else {
-    node.user_data = OpInit(
-        *registration, static_cast<const char*>(builtin_data_deleter.get()), 0);
-  }
+```text
+按 opcode_index 取 registration
+if CUSTOM: 解析 init_data 和大小
+else: 由相应的参数解析函数构造 builtin_data
+AddNodeWithParameters(算子的输入、输出、中间 Tensor 编号及参数)
+    编号列表 → TfLiteIntArray
+    OpInit(registration, init_data 或 builtin_data) → node.user_data
+    保存节点和注册项；把节点编号加入执行计划
 ```
 
 1. `ParseNodes()` 根据注册项区分 builtin 和 custom。Builtin 的类型化配置由 `ParseOpData()` 放到 `builtin_data`；custom 则通常把原始字节作为 `init_data` 交给注册内核解释。
@@ -345,43 +246,33 @@ Affine 分支检查参数个数、量化轴和 scale 个数与对应轴长度的
 
 有了 Tensor 和 Node 以后，Builder 还会扫一遍运行时 Tensor 表，把 `is_variable` 为真的编号收进 `SetVariables()`。这张表不是另一份输入列表：`inputs_` 回答「调用者喂什么」，`variables_` 回答「哪些 Tensor 是 Runtime 要跟踪的模型状态」。[收集变量索引](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L1122-L1129)。
 
+### 5.1 以 ADD 走完 Builtin 参数交接
+
+顺着 [ParseOpData 的构建分支](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/api/flatbuffer_conversions.cc#L3023-L3057) 和 [ParseAdd](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/api/flatbuffer_conversions.cc#L1126-L1149) 可核对原稿提出的两个问题：
+
+1. **为什么同时有两个参数对象？** 文件里的 `AddOptions` 是 FlatBuffer 视图，内核接收的 `TfLiteAddParams` 是 Runtime 布局。转换把融合激活枚举映射到 Runtime 枚举，并带上 `pot_scale_int16`；没有在这里执行 ADD，也没有改输入张量列表。
+2. **分配后失败由谁收尾？** `SafeBuiltinDataAllocator` 先把对象置于带 deleter 的作用域句柄中；成功才通过 `release()` 交给 `builtin_data`。之后由节点构造路径接管，不是 `release` 当场释放，也不能把 placement new 与析构混为一谈。
+3. **继续跟到 Init。** Custom 走原始 `init_data` 字节与长度；Builtin 可传类型化参数指针与约定的零长度。Init 的返回对象单独放在 `node.user_data`，与 `node.builtin_data` 分开。静态内存构建要查专用解析入口，不能直接照搬动态 Builder 的通用分派。
+
 ## 6. 签名、默认委托与分配入口
 
 `ParseSignatureDefs` 从文件的 signature key、subgraph_index 和具名 I/O 映射建立外部接口。这些名字用于调用签名，不等于必须覆盖原始 Tensor 名。构图结束前还导入 Metadata，按条件保存 resolver 的 lazy delegate creators，并执行调用方显式指定的委托。原稿中的 QS8/QU8 编译开关或 FP32 数量只决定是否获取默认工厂，不保证 XNNPACK 已创建或必然接管该图。显式 Delegate 被调用后用途仍可能未定，采用拥有型重载时实现会保留委托对象的所有权，不能因状态失败就假定马上释放，详见[第四篇](04-resolver-delegate.md)。
 
 原稿末尾再次应用动态大张量分配选项，是为了按最终图状态决定哪些张量可从 arena 改为 dynamic；所示分支会跳过图输入，只处理达到阈值的 `kTfLiteArenaRw` 张量，并清空旧数据指针，不是“在 Builder 里立即分配所有大张量”。实际运行通常经历 **建图 → AllocateTensors（Prepare/分配）→ 填输入 → Invoke**。排查错误时先定位失败阶段：注册失败查 opcode/版本，Prepare 失败查形状、量化或 unresolved custom，Invoke 失败再追内核执行。动态形状、委托和多次 resize 可能让准备工作在后续时机重跑。
 
+**Signature 的名字何时会改到 Runtime Tensor 上？** 一般的签名映射先记录参数名和 Tensor 编号；当前 Builder 只有在 `GetUseSignatureTensorNames()` 打开时，才遍历映射把名字写到对应子图的 Tensor 描述上。读原稿的「设置 Tensor 名称」时要保留这个条件；按 Signature 查名字和改写 Tensor 自己的名字不是同一件事。[Builder 名称分支](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L1026-L1058)
+
 ### 具名入口与默认委托的接点
 
-源码节选：[interpreter_builder.cc:1027–1030](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L1027-L1030)、[interpreter_builder.cc:1064–1067](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L1064-L1067)、[interpreter_builder.cc:1076–1080](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L1076-L1080)、[interpreter.cc:190–198](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter.cc#L190-L198)。
+实际源码：[interpreter_builder.cc:1027–1030](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L1027-L1030)、[interpreter_builder.cc:1064–1067](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L1064-L1067)、[interpreter_builder.cc:1076–1080](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L1076-L1080)、[interpreter.cc:190–198](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter.cc#L190-L198)。
 
-```cpp
-  if (ParseSignatureDefs(model_->signature_defs(), tmp_interpreter.get()) !=
-      kTfLiteOk) {
-    return kTfLiteError;
-  }
-
-// ...
-
-  if (ShouldCreateLazyDelegateProviders(num_fp32_tensors_)) {
-    tmp_interpreter->lazy_delegate_providers_ =
-        op_resolver_.GetDelegateCreators();
-  }
-
-// ...
-
-  if (TfLiteStatus status = ApplyDelegates(tmp_interpreter.get());
-      status != kTfLiteOk) {
-    return status;
-  }
-
-// ...
-
-TfLiteStatus Interpreter::AllocateTensors() {
-  if (ApplyLazyDelegateProviders() == kTfLiteError) return kTfLiteError;
-
-  return primary_subgraph().AllocateTensors();
-}
+```text
+Builder:
+    导入 Signature 定义
+    条件满足时保存 resolver 的 lazy creators
+    尝试应用显式委托；失败则返回对应状态
+Interpreter::AllocateTensors:
+    先尝试 lazy creators，再调用主子图进行准备与分配
 ```
 
 1. Builder 导入 Signature 的名称映射。显式签名的 `SignatureRunner::input_tensor(name)` 按名称找 Tensor 编号，再访问该签名选定的子图，不会把名字当作主子图 I/O 列表位置。[对照 SignatureRunner](https://github.com/tensorflow/tensorflow/blob/v2.20.0/tensorflow/lite/core/signature_runner.cc#L62-L78)。
@@ -390,7 +281,7 @@ TfLiteStatus Interpreter::AllocateTensors() {
 
 ## 源码入口
 
-代码对照版本：LiteRT [`e3c11f0`](https://github.com/google-ai-edge/LiteRT/tree/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62)；片段中的 `// ...` 表示省略。
+代码对照版本：LiteRT [`e3c11f0`](https://github.com/google-ai-edge/LiteRT/tree/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62)；流程块是按固定版本整理的阅读稿；可以点对应行号看完整实现。
 
 - [LiteRT CompiledModel 中的 InterpreterBuilder 使用](https://github.com/google-ai-edge/LiteRT/blob/main/litert/runtime/compiled_model.cc)
 - [TensorFlow Lite InterpreterBuilder](https://github.com/tensorflow/tensorflow/blob/master/tensorflow/lite/core/interpreter_builder.cc)
