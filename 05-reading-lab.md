@@ -76,6 +76,8 @@ return z && z[0] == 4.0f && z[1] == 6.0f ? 0 : 6;
 
 *图 5-2　同一个模型，两种外部调用顺序。左右分别是调用者看到的 API 流程，不是从左侧再转去右侧。Interpreter 例子用 typed_input_tensor 写入已分配的输入；CompiledModel 例子由调用方传入按签名创建的 TensorBuffer。执行后都应读出 [4,6]。*
 
+按本文固定的 LiteRT 版本，调用 `CompiledModel` 时看不到 Builder，但两条源码路径会在内部汇合：Runtime 可[复用模型留存的 FlatBuffer](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/runtime/compiled_model.cc#L1169-L1191)；若 JIT 改了模型，则[把新图序列化](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/runtime/compiled_model.cc#L2053-L2087)。随后 [`InitializeRuntime()`](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/runtime/compiled_model.cc#L673-L682)把对应的模型视图、Allocation 和 Resolver 传给内部的 `InterpreterBuilder`。这解释了为什么前面的 Builder 知识仍然用得上，但调用方在这条路线用的是签名和 `TensorBuffer`，而非直接操作 Interpreter 的输入指针。
+
 LiteRT 的 `CompiledModel` 接口把输入输出放在调用者持有的 `TensorBuffer` 对象中。下面按官方 `run_model_simple.cc` 的调用顺序摘出关键行，省略辅助函数、类型查询和输出比对的包装代码；`GetOptions()` 从示例配置中选 CPU，`path` 为模型路径。使用能取得签名索引 0、且该签名按 X/Y 顺序接受两个 float32 输入的测试模型。若手头模型没有符合假设的签名，先检查 API 反映出来的签名、输入输出布局和类型，不要硬套下面的下标。
 
 ```cpp
@@ -98,6 +100,8 @@ LITERT_RETURN_IF_ERROR(outputs[0].Read<float>(absl::MakeSpan(z)));
 这里有两处“第 0 个”也要分开：`sig=0` 选签名，`inputs[0]` 选这个签名的第一个输入。它们都不能直接充当子图张量表的索引。想继续看内部时，从 `CompiledModel::Create` 与同步 `Run` 往下追即可；具体后端初始化和委托选择以当前 checkout 为准，不要把第二篇的 IR 对象直接说成第三篇 Builder 的参数。
 
 ## 4. 改三个条件，检查自己有没有读懂
+
+这三个变化一次只改一项。调试时先记录共同基线：模型用哪个 opcode，Builder 给节点绑定了哪个 Registration，`AllocateTensors()` 后输入指针是否可用，`Invoke()` 时走的是普通节点还是代理节点。这样输出同样为 `[4,6]`，也能看出过程是不是同一条。
 
 | 改动 | 先判断什么 | 查哪里 |
 | --- | --- | --- |

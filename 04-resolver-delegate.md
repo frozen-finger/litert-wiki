@@ -2,14 +2,31 @@
 
 上一篇：[Builder（三）](03c-interpreter-nodes.md) · [目录](README.md) · 下一篇：[执行（二）](04b-interpreter-prepare.md)
 
-上一主题的 Builder 把节点接到了 Registration。这一篇先看 Resolver 怎样提供实现，再以 ABS 跟完 Init、Prepare、Resize 和 Invoke。Delegate 的创建、选点和分区另在后面的主题里按发生顺序展开。
+回到 [Builder（一）的构造入口](03-interpreter-builder.md#1-builder-的构造与入口检查)：调用方传入 `model` 和 `resolver`。模型给出「我要哪个算子、哪一版」，Resolver 给出「本次构建用哪套实现」。[Builder（三）](03c-interpreter-nodes.md#1-parsenodes把-tensor-和注册项接起来)已经把查到的 Registration 放进节点记录；本篇沿这条链往回看一次查找，再往前看 ABS 怎样执行。
 
 ## 1. Resolver 查找什么
 
+### 先和 InterpreterBuilder 对上
+
+先延续 [上篇的 ADD](03c-interpreter-nodes.md#2-以-add-走完参数交接)：T0、T1 作为输入，T2 作为输出。在这版源码中，[`Register_ADD`](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/kernels/add.cc#L496-L504)提供 ADD 的注册项，[`Prepare`](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/kernels/add.cc#L90)用输入形状确定输出形状，[`Eval`](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/kernels/add.cc#L415)才真正读取输入、计算结果。下面换成 ABS，查表和绑定的步骤不变；换例子是为了看清单个内核的量化和 Resize 分支。
+
+以一个序列化 ABS 节点为例，设它的 `opcode_index=0`，读 T3、写 T7。读代码时依次看这几个地方：
+
+| 时机 | 谁在做 | 交给下一步什么 |
+| --- | --- | --- |
+| 构造 Builder | 调用方传入 Resolver，Builder 保存引用 | `op_resolver_` |
+| 建立本地映射 | `GetRegistrationFromOpCode()` 读 `Model.operator_codes[0]`；内建 ABS 按类型和版本 `FindOp` | `flatbuffer_op_index_to_registration_[0]` |
+| 导入节点 | `ParseNodes()` 取本地表第 0 项，连同 T3/T7 等节点信息传给 `AddNodeWithParameters()` | Subgraph 中的节点和 Registration 副本；有 Init 回调时，节点保存它返回的状态 |
+| 准备与执行 | Subgraph 从执行计划找到节点及 Registration | Prepare 推导形状，Invoke 读 T3 并写 T7 |
+
+文件里第 0 项可以被多个 Operator 引用。若第二个 ABS 读的是 T5，就仍可用同一组回调，但它不会借用第一个 ABS 的 I/O 索引或 `user_data`。查找不到时也要分开看：未注册的内建版本会让 Builder 失败；有名称的自定义算子可以先成为占位项，等待适配的 Delegate 接管，否则会在准备阶段报错。
+
+另有一条独立支路：同一个 Resolver 可提供**默认 Delegate 工厂**。Builder 会在符合条件时保存工厂，供后续尝试改图；给 ABS 找到普通 Registration 不意味着选了 XNNPACK，更不意味着该节点已经被委托。[创建与应用 Delegate](04c-delegate-setup.md#3-显式应用与-lazy-delegate)会接着讲这条线。
+
 | 需要回答的问题 | 对象 |
 | --- | --- |
-| 这个内建算子是什么版本？ | `FindOp(builtin_code, version)` |
-| 这个自定义算子叫什么、是什么版本？ | `FindOp(custom_name, version)` |
+| 模型要求的内建算子版本有对应实现吗？ | `FindOp(builtin_code, version)` |
+| 这个名称和版本的自定义算子有对应实现吗？ | `FindOp(custom_name, version)` |
 | 可以提供哪些默认 Delegate？ | `GetDelegateCreators()` / `GetOpaqueDelegateCreators()` 返回工厂，不是已创建实例 |
 | 是否可能含有用户自定义算子？ | `MayContainUserDefinedOps()`；基类默认保守返回 true，并不说明已找到一个自定义节点 |
 
@@ -25,12 +42,12 @@ Opaque 工厂用于不透明 C API 对象，不能仅按「是不是 Google Play
 
 对照：[OpResolver 实现](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/api/op_resolver.cc)。
 
-op_resolver是一个抽象基类，其中主要有以下的几个函数：
+`OpResolver` 是抽象基类。前两个 `FindOp` 是 Builder 做普通算子绑定时调用的接口；工厂与能力查询由不同的代码路径使用：
 
-- findop 通过提供的op信息找到对应的registration，有两种，一种可以通过builin的enum code找到对应的算子实现，还有一种可以通过op的name找到算子实现
-- GetDelegateCreators 返回delegatec的创建方法，可以用来针对flatbuffer中的op创建对应的delgate
+- `FindOp`：按内建枚举或自定义名称，加上版本，返回 Registration。
+- `GetDelegateCreators()`：返回工厂函数。工厂提供潜在后端，不逐个返回某个算子的实现。
 `GetOpaqueDelegateCreators()` 面向不透明 C Delegate API；不能把它等同于某个特定发行渠道。
-- MayContainUserDefinedOps 返回是否有builtin之外的用户自定义op，目前默认返回为true，代表了可能会存在builtin之外的op但不代表一定存在
+- `MayContainUserDefinedOps()`：用于保守判断当前 Resolver 是否可能提供用户自定义算子，默认 `true` 不表示某个模型实际用了它们。
 
 还包括一些重要的属性：
 
@@ -39,7 +56,7 @@ op_resolver是一个抽象基类，其中主要有以下的几个函数：
       std::vector<std::unique_ptr<TfLiteDelegate, void (*)(TfLiteDelegate*)>>;
 ```
 
-代表了一系列delegate
+这是拥有若干 Delegate 实例的容器，元素带对应的删除器。
 
 ```cpp
   using TfLiteDelegateCreator =
@@ -49,7 +66,7 @@ op_resolver是一个抽象基类，其中主要有以下的几个函数：
   using TfLiteDelegateCreators = std::vector<TfLiteDelegateCreator>;
 ```
 
-delegate的创建函数
+这是工厂函数及其集合。函数接收 Context，返回拥有型 Delegate 指针；保存工厂和执行工厂是两步。
 
 ## 2. Registration 与 Node 的职责
 
@@ -139,7 +156,7 @@ multableopresolver继承了opresolver，并额外添加了以下的成员
 
 - AddAll，接受mutableopresolver的指针作为参数，向本resolver添加所有指针指向的resolver中的算子
 
-- ChainOpResolver, 与addall功能类似，但是实现上只保存了指向resolver的指针，当需要时链式查找保存的指针指向的resolver有没有适合的算子，所以如果原本resolver中已有了对应算子的注册则不会查找到传入的resolver
+- `ChainOpResolver` 保存对另一个 Resolver 的引用。本地找不到才查链；本地已有相同 key 时，不会去链上替换实现。与 `AddAll()` 直接合入注册表区分开。
 
 - builtins, 保存opcode到registration的映射
 
@@ -201,7 +218,7 @@ void MutableOpResolver::AddCustom(const char* name,
 }
 ```
 
-与上者类似，只是匹配改用name而不是op code
+内建和自定义查找的顺序相同；不同的是前者以枚举为 key，后者以名称为 key，两者都带版本。
 
 ```cpp
 void MutableOpResolver::AddAll(const MutableOpResolver& other) {
@@ -265,6 +282,8 @@ void BuiltinOpResolver::RegisterBuiltinOps() {
 
 以ABS为例：
 
+到这里已经回答「框架怎样找到函数」。下面换一个比 ADD 更容易看清量化细节的一元算子 ABS。看的是同一份 Registration 如何分别参与节点初始化、形状准备和实际计算；ABS 切换了示例，没有改变此前介绍的建图方式。
+
 ## 4. 以 ABS 跟一次 CPU 算子
 
 源码入口：`tflite/kernels/elementwise.cc` 中的 `Register_ABS`，再追 `ElementWiseQuantizedInit` / `ElementWiseQuantizedFree`、`PrepareAbs` / `GenericPrepare` 以及 `AbsEval`。把生成回调的宏展开来看，仍是普通函数指针调用。
@@ -294,7 +313,7 @@ TfLiteRegistration* Register_ABS() {
 }
 ```
 
-这里的四个参数即为init，free, prepare和invoke的指针，一次看一下每个方法的实现
+按 `Init → Prepare → Invoke` 的顺序跟三次调用；`Free` 对应节点状态清理。它们来自同一份 Registration，但触发时机不同：Init 通常在加节点时，Prepare 可以因重新分配或动态形状再次运行，Invoke 才读取本次输入。
 
 ```cpp
 void* ElementWiseQuantizedInit(TfLiteContext* context, const char* buffer,
@@ -587,7 +606,7 @@ TfLiteStatus AbsEval(TfLiteContext* context, TfLiteNode* node) {
 }
 ```
 
-最后是invoke方法，根据tensor的数据类型主要包含两种实现方式，这里取tensor时是取的input中的第一个tensor。
+到了 `Invoke` 才从节点的第一个输入索引拿到本次实际数据。先看非量化路径怎样逐元素取绝对值，再和量化路径对照：量化结果可能还需要换算到输出的 scale 和零点。
 对于float32，int32的情况下会直接做evalimpl，evalimpl只是对原来最简单的std::abs方式做了一层封装，在外部额外检查了数据是否合法
 
 ```cpp
@@ -614,7 +633,7 @@ TfLiteStatus AbsEvalQuantized(TfLiteContext* context, TfLiteNode* node,
 }
 ```
 
-这里完成三件事，首先计算了量化输入消除zeropoint后的绝对值，之后判断输入与输出的scale是否不同，如果不同就通过整数运算重新量化，最后将结果限制到给定范围内，对INT8就是-128，127
+INT8 路径可以分三步读：减输入零点再取绝对值；必要时用整数乘数和移位换算尺度；加输出零点并限制到 `[-128,127]`。所以不能直接把存储的 INT8 字节当成真实数值取绝对值。
 
 ```cpp
 inline TfLiteStatus AbsInt16EvalImpl(TfLiteContext* context, TfLiteNode* node,
@@ -636,3 +655,5 @@ inline TfLiteStatus AbsInt16EvalImpl(TfLiteContext* context, TfLiteNode* node,
 ```
 
 普通 INT16 路径扩大中间运算位宽。中间值扩大并不自动保证写回 INT16 可表示所有结果，边界行为要看对应内核。
+
+ABS 的 `Prepare` 只是单个节点的回调。下一篇 [Prepare、分配与动态 Invoke](04b-interpreter-prepare.md)回到 Subgraph，解释这些回调按什么顺序调用，以及有的输出为什么要等到 Invoke 才知道尺寸。

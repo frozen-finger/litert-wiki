@@ -4,6 +4,8 @@
 
 普通内核的 Prepare 不等于委托的 Prepare，也不等于已执行节点。先把运行时准备和分配的流程读通，后面就能理解为什么静态 Delegate 应用前还要预跑普通算子的 Prepare。
 
+承接 [ABS 的单节点 Prepare](04-resolver-delegate.md#4-以-abs-跟一次-cpu-算子)：ABS 知道自己的输出怎样跟随输入，但不会安排后续节点。这个工作由 Subgraph 完成。跟读时分清 **算子的 Prepare 回调**、**Subgraph 的准备游标**、**内存规划器的分配游标**；两个游标存的是执行计划位置，不是节点或 Tensor 编号。
+
 ## 1. PrepareOpsStartingAt：逐个执行计划位置准备
 
 [固定版本源码：逐节点准备](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L1584-L1625)
@@ -95,6 +97,8 @@ Prepare 之前给描述数组保留空间。若需要 `reserve`，取当前大�
 **为什么会停在动态节点，而不是等它的下游先 Prepare？** 下游可能要用它的实际输出尺寸来决定缓冲区大小。假设计划是 `[7, 2, 9]`，节点 7 产出动态 Tensor：本轮可记下位置 0 并暂时结束；这不表示节点 7 已经 Invoke，也不表示 Tensor 编号是 0。普通的动态临时 Tensor 不触发这个停止规则。
 
 ## 2. OpPrepare 如何找到实际回调
+
+[Resolver 篇](04-resolver-delegate.md#1-resolver-查找什么)已经查到 Registration，这一步只决定调用它的哪个回调，不再查 `FindOp()`。可以先跟普通内核的 `op_reg.prepare`，再回来看 opaque 包装和转发分支。
 
 [固定版本源码：普通与不透明回调](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L1419-L1491)
 
@@ -191,6 +195,8 @@ TfLiteStatus Subgraph::OpPrepare(const TfLiteRegistration& op_reg,
 - **已经准备到哪里，只分配到哪里。** 当前计划的 Prepare 游标更新为 `last + 1`。需要时建立内存规划器并规划，再对本轮已准备区间执行分配；核对自定义分配后推进分配游标。Prepare 与分配是两步，不是 `OpPrepare` 调完就等于所有数据已分配。
 - **执行时继续。** 例如节点 7 的输出大小由输入内容决定，后续节点 2 依赖它。初始准备可先停在节点 7；Invoke 执行节点 7 后，走到计划位置 1 才继续准备节点 2。如果本轮执行让动态输出改变大小，准备起点重设为当前项之后；已超前规划的下游内存也会被重置。不会从计划位置 0 无条件重做整图。
 
-原稿的 Prepare 循环只推进“已准备到哪里”。调用者 `PrepareOpsAndTensors()` 还要更新准备和分配的两个位置，执行本轮 arena 分配。若某个委托要求形状先传播，还会先准备委托前的计划。进入 Invoke 后，执行走到准备游标才会继续 Prepare；如果本次内核实际改变了动态输出尺寸，还可能回退下游分配游标。不要把这几个计数器合称为 Tensor 编号。
+把上一节的计划 `[7, 2, 9]` 走完：若节点 7 的输出大小取决于输入值，`AllocateTensors()` 可以先准备位置 0，把下次 Prepare 的起点记成 1，并执行本段可做的分配。填入数据、调用 `Invoke()` 后，节点 7 先产生实际输出；走到位置 1 才继续准备依赖它的节点 2。若之后运行时输出再次变大或变小，回退的是受影响的下游准备和分配进度，不是重做整个 Builder。
 
 对照：[准备和分配](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L1627-L1700) · [执行中续跑](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L1743-L1757) · [动态输出改变时回退](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L1828-L1856)。
+
+这个循环在 [静态 Delegate 的改图预检查](04c-delegate-setup.md#静态委托为何先跑普通算子的-prepare)还会出现一次。那时跑普通内核的 Prepare，是为了先判断图能否满足 Delegate 的形状要求；随后才会进入 Delegate 自己的 Prepare。

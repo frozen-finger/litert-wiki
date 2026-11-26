@@ -4,6 +4,8 @@
 
 在 Context 已开放委托回调后，XNNPACK 先枚举可接管节点，再处理仅依赖常量的转换。这一篇说明“选了谁”，下一篇再解释“怎么合成分区与代理节点”。
 
+上一章把 Context 切换到允许查看和改写图的接口。这里交回给 Subgraph 的是**节点编号列表**，不是新执行计划。为了读懂候选检查，先看普通路径；MoE 与静态权重展开是两条附加分支。
+
 ## 1. 枚举候选并交给 Runtime
 
 `DelegatePrepare` 先找候选，再向 Subgraph 发出改写请求。判断不是只看 opcode，还依赖参数、张量类型、形状、常量属性及实际 kernel 覆盖。在原稿的实现中，常规节点与 MoE 节点分组提交。这里的 MoE 是特定自定义算子，不代表 XNNPACK 会识别任意写成通用子图的专家网络：路由输入决定选哪些专家，权重/scale 的数量和类型都属于匹配条件。原稿分支的匹配包括指定 custom 名称、可解析属性（专家数和隐藏/模型维度等）、单输出、浮点权重 7 输入或量化权重 10 输入、FP32 激活/权重系数/输出与 INT32 路由索引；专家权重静态且形状、类型、元素数正确，量化 scale 也须静态且符合要求。这些是该版本检查项，不是跨版本的 MoE 接口规范。
@@ -74,7 +76,7 @@ TfLiteStatus DelegatePrepare(TfLiteContext* context, TfLiteDelegate* delegate) {
 
 </details>
 
-prepareOpsToDelegate会决定哪些算子可以交给XNNPACK，而replacenodesubsetswithdelegatekernels负责把这些节点替换成委托执行的节点，这里的data即是指向delegate对象自己的指针。其中算子分为两种，moe算子和普通算子，会有两次替换处理分别针对这两种不同的算子，moe算子是针对混合专家模型的特殊实现，它是一种动态选择计算分支的结构，由多个基础算子组合而成，moe中还包含了路由，决定最后会选择哪个专家模型。
+`PrepareOpsToDelegate()` 负责选点，`ReplaceNodeSubsetsWithDelegateKernels()` 负责改执行计划。此处 `data` 指向 XNNPACK Delegate 自身。普通节点和受支持的 MoE（混合专家）自定义节点分别提交；MoE 的路由输入用来决定这次计算选哪些专家，而不是让 Runtime 事后把任意算子组合认成 MoE。
 
 ## 2. 消费者、MoE 与普通候选
 
@@ -138,7 +140,7 @@ TfLiteIntArray* Delegate::PrepareOpsToDelegate(
   std::unordered_set<int> quasi_static_tensors_to_unpack;
 ```
 
-quasitensor是指准静态张量，虽然它由计算图的某个算子产生，但输入来自静态常量，所以输出可以提前确定，不需要每次提前计算，例如INT8到FP32的反量化转换结果。quasi_static_tensors_producers记录了quasitensor是由哪个node产生的，quasi_static_tensors记录了有哪些quasitensor，quasi_static_tensors_to_unpack记录被委托给XNNPACK节点使用，需要提前展开的quasi_static_tensor，这里的展开指分配buffer，执行反量化或稀疏展开。
+准静态 Tensor 是图上的算子输出，但其输入来自常量，因此结果可以在准备时算出。`quasi_static_tensors` 记候选，`quasi_static_tensors_producers` 记生产它的节点，`quasi_static_tensors_to_unpack` 只记 XNNPACK 需要提前展开的子集。三个集合或映射回答的是三个问题，不是重复存同一份权重。
 
 ```cpp
   TfLiteIntArray* nodes_to_delegate =
@@ -297,7 +299,7 @@ isSupported本身比较复杂，浓缩成以下的内容：
 
 </details>
 
-此处识别了可以提前执行反量化的tesnor，并将tensor记录quasi tensor
+以上只把满足条件的反量化输出记成准静态 Tensor；没有在判定时立即转换。等确定有委托节点需要这个结果，再分配空间并展开。
 
 1. 判断 DEQUANTIZE 是否可以提前处理
 
@@ -590,7 +592,7 @@ visitnode是方法的核心，用于检查一个算子是否能交给XNNPACK执�
 
 </details>
 
-此处对需要提前处理的quasitensor执行实际的数据展开，将结果保存到buffer中，包含5个步骤
+上面的循环才真正展开权重，可以按以下五步对照：
 
 1. 遍历需要展开的tensor
 2. 获取producer node并检查
@@ -666,6 +668,6 @@ visitnode是方法的核心，用于检查一个算子是否能交给XNNPACK执�
 
 3. 对委托节点数组排序
 
-其中有一个测试模式的宏会将所有节点标记为XNNPACK支持，为了禁止不受支持的节点静默回退到tlite kernel，从而无法暴露问题
+`XNNPACK_DELEGATE_TEST_MODE` 是测试特例：强制把执行计划里的节点都交给 Delegate，以便暴露未实现路径。实际运行的支持范围不能从这段测试分支推断。
 
-接下来是做实际替换的环节, 这个函数是在switchtodelegatecontext时注册到context里的，实际使用的是subgraph（tflite）中的实现
+交接点是 `context->ReplaceNodeSubsetsWithDelegateKernels`：入口在切到 Delegate Context 时开放，实现仍在 TFLite 的 Subgraph。下一篇 [图分区与代理节点](04e-delegate-partition.md)接着看为什么这些节点可能组成多个分区，以及哪部分数据必须留在分区边界。
