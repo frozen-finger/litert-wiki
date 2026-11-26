@@ -4,6 +4,8 @@
 
 这一篇先区分显式应用和默认工厂，再看 XNNPACK 适配层的线程池、权重缓存和所有权。创建对象不等于接管节点；应用之前还要通过子图和动态形状检查。
 
+先接上 [Resolver 的第二条支路](04-resolver-delegate.md#1-resolver-查找什么)：`GetDelegateCreators()` 只把后端创建方法交给 Interpreter，`FindOp()` 才给普通节点提供 Registration。后面先看真正生成 Delegate 的时机，再看它如何拿到普通节点的信息。
+
 ## 1. Delegate 接口、能力与缓存句柄
 
 ![图 4-2：Delegate：显式应用与惰性应用的时机](figures/11-delegate-control.png)
@@ -56,7 +58,7 @@ XNNPACK 是 CPU 推理内核库，XNNPACK Delegate 是其与 Interpreter 之间�
 ```
 
 builtinopresolver创建的最后，还会向delegate_createors_中推入了一个lambda表达式用于创建delegate
-MaybeCreateXNNPACKDelegate受到编译期宏TFLITE_BUILD_WITH_XNNPACK_DELEGATE影响（即是否集成XNNPACK），XNNPACK时一个google提供的高性能CPU神经网络推理计算库，XNNPackQS8Options时LiteRT中控制XNNPACK部分量化算子支持情况的配置枚举，此处的XNNPACK delegate也就是XNNPACK和LiteRT之间的适配层，基于集成或不集成分为两种情况。
+`TFLITE_BUILD_WITH_XNNPACK_DELEGATE` 决定这个构建能否真正走 XNNPACK 创建分支；`XNNPackQS8Options` 是其中有符号 8 位量化支持的配置。读工厂时先区分「二进制有没有后端」和「启用了哪些类型的算子」，后者仍不是接管结果。
 
 集成的情况：
 
@@ -224,7 +226,7 @@ CpuBackendContext继承自TfLiteInternalBackendContext, 代表了一系列可供
 
 </details>
 
-weights_cache_是XNNPACK的权重缓存，weight_cache_provider是负责提供，查找，保存以及管理缓存内容的对象，在XNNPACK中模型权重通常需要经过weight packing权重重排，转换成更适合CPU读取的内存布局，但转换比较耗时所以XNNPACK可以缓存转换后的权重供后续runtime或者interpreter使用。
+`weights_cache_` 是缓存，`weight_cache_provider` 负责提供、查找和管理内容。packing 得到的是内核偏好的权重布局；可复用的是这份准备结果，不是上一轮的激活或模型输出。
 若配置提供外部 provider，Delegate 使用但不接管其所有权；若传入适用的缓存路径且没有外部 provider，可以建立自己的。锁页用于减少换出，并不消除所有缺页。
 
 对于没有启用XNNPACK的情况下，则会直接返回空指针
@@ -420,7 +422,7 @@ TfLiteStatus Subgraph::ModifyGraphWithDelegateImpl(TfLiteDelegate* delegate) {
     state_ = kStateUninvokable;
 ```
 
-首先判断了delegate是否支持dynamic tensor，是否支持single delegate即一个delegate可以支持graph内的所有算子（此处只代表delegate的能力不代表实际替代）。
+这里判断两种不同的承诺：是否支持动态 Tensor，以及调用方是否提示由单个 Delegate 接管整图。提示可以改变准备流程，但实际是否全接管还要在改图后检查。
 kStateInvokableAndImmutable代表了当前的计算图已经主备好并且不支持dynamic tensor，为了应用新的delegate，将state暂时转换为uninvokable即不可调用，以便后续prepare和内存规划。
 
 ```cpp
@@ -503,4 +505,4 @@ TfLiteStatus TfLiteDelegatePrepareInternal(TfLiteContext* context,
 }
 ```
 
-此处对delegate做了类似operator的方式，对于透明和不透明的接口有不同的处理方式, 以XNNPACK为例看一下delegate是怎么做prepare的. 在XNNPACK内部有一个TfLiteDelegate对象，他在xnnpackdelegate被创建时被注册给了subgraph，其中prepare方法会被指向XNNPACK内的DelegatePrepare方法
+普通内核和 Delegate 都有传统/不透明两类回调入口，但它们处理的对象不同。图上各节点的 `OpPrepare` 处理节点和张量；图级 `TfLiteDelegatePrepareInternal()` 把当前图交给 Delegate 检查。XNNPACK 对象创建时已填好 `Prepare` 回调，子图在应用它时才调用。接着读 [XNNPACK 选点](04d-delegate-xnnpack.md)，看这个回调如何产生候选列表。

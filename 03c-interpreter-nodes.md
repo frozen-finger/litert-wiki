@@ -4,6 +4,8 @@
 
 这一篇从 Tensor 表追到 `TfLiteNode`，再跟 Signature、Metadata 和 Delegate 入口。目标是看清哪些数据由 Builder 填入，哪些工作留到 `AllocateTensors()` 或 `Invoke()`。
 
+以 ADD 为线索：文件 Operator 告诉 Builder **读哪两个 Tensor、写哪一个**；`TfLiteAddParams` 告诉内核**怎样执行这个 ADD**；Registration 提供**调用哪个函数**。这三样在 `ParseNodes()` 一起交给运行时，但只有到了 Invoke 才会计算输出。
+
 ## 1. ParseNodes：把 Tensor 和注册项接起来
 
 每个序列化 Operator 给出 I/O 索引，Builder 通过 `opcode_index` 取得 registration，再为节点准备参数。
@@ -14,6 +16,8 @@
 - `BuiltinDataAllocator` 抽象参数结构的申请与释放；placement new 负责在已有存储中构造对象，不会让 `free` 自动调用析构。具体实现采用适合其参数结构的约定，并借助作用域对象清理失败时尚未转交的参数。若启用标准 aligned_alloc，其 size 必须满足 alignment 的倍数要求。Micro 的静态内存构建和逐算子解析入口不是桌面动态 Interpreter 的通用行为。
 
 `nodes_and_registration_` 每个元素包含 `TfLiteNode` 和对应的 `TfLiteRegistration`：Node 持有输入、输出、临时/中间索引与参数等，registration 才告诉它如何 Prepare/Invoke。原始执行计划收录新加入的节点索引；计划可因 Delegate 而改写，所以“所有节点的存储数组”和“当前要依次执行的节点索引”是两回事。以 `inputs=[0,1], outputs=[2]` 的 ADD 为例，槽位 0/1 指向输入，槽位 2 对应输出，执行时由该版本 ADD kernel 实现读取和写入，不用按字符串名称找 tensor。
+
+承接 [Builder 的注册索引表](03-interpreter-builder.md#2-从文件-opcode-找到-registration)：`ParseNodes()` 拿到每个节点的 Registration，连同张量索引和参数交给 `AddNodeWithParameters()`。[Subgraph](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/subgraph.cc#L1159-L1243)保存节点及注册记录，并用对应的初始化入口取得节点状态。后面 Prepare/Invoke 从节点记录取回调，不会再为了这个节点按 opcode 查一遍 Resolver。
 
 对照：[ParseNodes](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L335-L409)。
 
@@ -142,7 +146,7 @@ TfLiteStatus ParseOpData(const Operator* op, BuiltinOperator op_type,
 }
 ```
 
-STATIC_MEMEORY为一个编译期宏，用于支持TensorFlow Lite Micro这类以静态内存管理为主的嵌入式运行环境，如果定义了该宏则不走ParseOpData，而是需要调用者使用具体的paarseAdd等算子解析函数。Micro主要为了应对条件十分受限的嵌入式领域，只有一块固定容量的内存，一般情况下走ParseOpDataTfLite路径
+`TF_LITE_STATIC_MEMORY` 面向 TensorFlow Lite Micro 等有固定容量、受限内存的构建。定义该宏时，不走桌面动态 Interpreter 的通用 `ParseOpData` 分派；核对 Micro 时要跟实际构建的入口和对应算子解析器，例如 `ParseAdd`。
 
 ```cpp
 TfLiteStatus ParseOpDataTfLite(const Operator* op, BuiltinOperator op_type,
@@ -273,7 +277,7 @@ inline bool ShouldCreateLazyDelegateProviders(int num_fp32_tensors) {
   }
 ```
 
-applydelegates本身比较复杂
+下面只看 Builder 怎样交接 Delegate；子图怎样检查条件、选点和改图，留到 [Delegate（一）](04c-delegate-setup.md)。
 
 ### 显式委托与 Flex 的所有权差异
 
@@ -333,7 +337,7 @@ Flex 和普通外部委托最终都进入改图逻辑，但所有权不同：这
 }
 ```
 
-interpreteroptions在之前已经设置过一次，但是当初设置时还没有做parsetensor，所以对large tensor的优化无法执行，此处再调用一次执行优化，具体会调用到每个subgraph中的优化
+第一次设置 options 时，还没完成 `ParseTensors()`，不知道每个大张量的最终描述。这里再次应用相关选项，遍历已建好的子图来调整可用的分配策略。
 
 ### 大张量优化为何在构图末尾再做
 
@@ -365,6 +369,8 @@ void Subgraph::OptimizeMemoryForLargeTensors(
 对于大小以及type符合要求tensor，type会从arenarw改为dynamic，使得large tensor在执行时可以动态分配内存。分配内存涉及到arena等相关内容，在相关章节说明。
 
 至此，interpreter已经构建完成。
+
+Builder 到这里已经把构建期的查表结果交给子图。接着读 [Resolver 与 ABS](04-resolver-delegate.md#1-resolver-查找什么)，回到最初的 `resolver` 参数，沿一次查找跟到节点执行。
 
 ## 源码入口
 

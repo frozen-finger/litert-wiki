@@ -2,6 +2,19 @@
 
 面向想读端侧推理框架源码的开发者：一个 `.tflite` 文件进入进程之后，张量、节点和内存分别在哪里建立，最后又由谁执行？
 
+## 从哪一篇开始
+
+第一次读，建议先打开 [ADD 实验](05-reading-lab.md#1-先把计算和文件对起来)认一遍三个张量：输入 X、Y 和输出 Z。然后从模型格式开始，在每一阶段问：**现在拿到的是什么对象？它知道形状了吗？它已有数据地址了吗？**
+
+```text
+同一份 .tflite：字节 → 按 Schema 访问 tflite::Model
+    ├─ LiteRT Model API → 解包为 LiteRtModelT → CompiledModel 等后续路径
+    └─ TFLite 兼容 API → InterpreterBuilder → Interpreter / Subgraph
+         → Prepare 与分配 → 填入本次输入 → Invoke → 读取输出
+```
+
+第一条线用于读模型、编译和使用 LiteRT API；第二条线便于追踪 Interpreter 的节点、内存和执行。两条线可以在运行时实现中相遇，但文档的阅读顺序不代表运行时每次都要先走完第一条。读 Delegate 时再往回看它如何改写 **Interpreter 的执行计划**。
+
 ## 阅读目录
 
 | 主题 | 篇目 |

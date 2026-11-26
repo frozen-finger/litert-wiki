@@ -52,6 +52,8 @@ CPU / GPU / NPU
 
 ---
 
+上面的图选的是 LiteRT Model API 路线。如果只想用兼容的 [InterpreterBuilder](03-interpreter-builder.md)，从 FlatBuffer 视图即可开始建运行时图，不先构造 `LiteRtModelT`。下面的寻址原理与 Schema 两条路线共用。追到 CompiledModel 内部时，两条路线还会在 `InterpreterBuilder` 汇合，见 [ADD 实验的路线 B](05-reading-lab.md#3-路线-b用-compiledmodel-看外部-buffer-怎样绑定)。
+
 ## 2. FlatBuffers：文件如何编码
 
 ![图 1-1：FlatBuffers 的四段寻址](figures/01-flatbuffers-offset.png)
@@ -224,7 +226,7 @@ SubGraph[0].outputs    : [2]
 SubGraph[0].operators  : [{opcode_index: 0, inputs: [0, 1], outputs: [2]}]
 ```
 
-这里出现了三种彼此独立的索引：`opcode_index=0` 查全模型的算子类型表；`inputs=[0,1]` 查本子图的张量表；张量的 `buffer=0` 查全模型的 Buffer 表。文件只保存关系和形状，不保存调用者下一次会传入的 `x=[1,2]`、`y=[10,20]`；运行时绑定输入并执行后才会得到 `z=[11,22]`。如果改成把 `y` 固定为常量，可以让它引用非零 Buffer，同时将 `SubGraph.inputs` 改成 `[0]`。ADD 的操作数仍是 `[0,1]`：**算子输入与模型对外的输入并不是同一个集合**。
+这里出现了三种彼此独立的索引：`opcode_index=0` 查全模型的算子类型表；`inputs=[0,1]` 查本子图的张量表；张量的 `buffer=0` 查全模型的 Buffer 表。文件只保存关系和形状，不保存调用者下一次会传入的 `x=[1,2]`、`y=[3,4]`；运行时绑定输入并执行后才会得到 `z=[4,6]`。如果改成把 `y` 固定为常量，可以让它引用非零 Buffer，同时将 `SubGraph.inputs` 改成 `[0]`。ADD 的操作数仍是 `[0,1]`：**算子输入与模型对外的输入并不是同一个集合**。
 
 ### 3.3 Subgraph 是什么
 
@@ -289,6 +291,8 @@ table SignatureDef {
 > 重要：`ReadBuffer()` 内部使用的 `is_external`，就其实现而言主要表示“**数据在 FlatBuffer 主体之外、但仍位于当前 Allocation 中**”，不能直接理解成“位于独立 `.bin` 文件”。
 
 ---
+
+到这里，已经能从一个 Operator 找到**算什么、从哪读、向哪写**。下一步要回答的是另一个问题：如果某个 Tensor 是量化或稀疏权重，Buffer 里的字节该怎样解释？量化改变数值的表示，稀疏编码额外描述哪些位置存在；两者都不改变 Operator 用 Tensor 编号连边的方式。
 
 ## 4. 量化、稀疏张量及特殊结构
 

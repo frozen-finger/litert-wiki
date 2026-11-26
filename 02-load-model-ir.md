@@ -1,6 +1,6 @@
 # LiteRT 源码笔记（二）：模型加载、权重与内部 IR
 
-[第一篇](01-model-format.md)从 `.tflite` 字节读出了子图、张量和操作数索引。本篇从 `Model::CreateFromFile()` 往下走，看这些索引如何成为 LiteRT 内部对象和边，以及权重数据为何经常不必复制。加载成功并不意味着执行资源准备完毕。
+[第一篇](01-model-format.md)解释了怎么从文件找到张量和算子。本篇读同一份 `.tflite` 的另一层：`Model::CreateFromFile()` 如何把表和索引变成 LiteRT 能遍历的图。用 ADD 作参照：文件说 ADD 读 T0/T1、写 T2；解包后 IR 里的 Op 持有这几个 Tensor 的引用。至于本次输入的数值，还没有传进来。
 
 **两条源码路径不要混用**：本篇的 `LiteRtModelT` 属于 LiteRT Model API；[InterpreterBuilder（一）](03-interpreter-builder.md)谈的是兼容的 TFLite `InterpreterBuilder` 路径，它从 `tflite::Model` 或 `FlatBufferModel` 等入口构造自己的运行时结构，并不要求先经过本篇的 `UnpackModel()`。
 
@@ -114,7 +114,7 @@ CreateFromTflFile(path, allow_changes):
 
 ### 2.3 验证什么、不验证什么
 
-原笔记把这里拆成两次排查：先问「文件有没有变成可读字节」，再问「这些字节能不能按 TFLite Schema 解释」。两项都通过仍不代表图能用；例如某个算子引用了不存在的 Tensor，下文要等解包时才能发现。
+排查时可以分成两次：先确认文件能否读成字节，再确认字节能否按 TFLite Schema 解释。两步都过了，仍可能在解包时发现引用了不存在的 Tensor。
 
 完整 FlatBuffers Schema Verifier 的检查重点包括：
 
@@ -201,7 +201,7 @@ for each serialized_subgraph in packed_model:
 
 ### 3.2 解包一个 Subgraph
 
-对每个 Packed Subgraph，Loader 创建一个 `LiteRtSubgraphT`，然后调用 `UnpackSubgraph()`。
+把上面的外层循环换成实际调用来看：`EmplaceSubgraph()` 返回本次要填的 IR 子图；`UnpackSubgraph()` 同时拿到源和目标。
 
 ```cpp
 const auto* packed_model = context.PackedModel();
@@ -248,6 +248,8 @@ for (auto i = 0; i < num_tensors; ++i) {
 这也解释了为何需要与地址稳定性相适配的模型容器及对象生命周期管理，而不是把 Tensor 仅作为临时循环变量。
 
 ---
+
+两遍循环之后，张量对象和编号已经能对上。接下来沿其中一个 `UnpackTensor()` 调用追：张量属性写在哪，权重又是借用模型中的字节，还是只先保留外部引用？
 
 ## 4. Tensor、权重与 BufferManager
 
@@ -429,6 +431,8 @@ litert_tensor.SetQarams(
 
 ---
 
+到这一步已有 Tensor 对象，常量也已关联到对应的 Buffer 或外部权重记录。接下来读 Operator 的 `inputs/outputs`，用这些对象给算子连边；不再从权重 Buffer 反推图结构。
+
 ## 5. Operator 解包与图连接
 
 ### 5.1 `LITERT_NO_BUILTIN_OPS` 的实际影响
@@ -582,6 +586,8 @@ litert_subgraph.Outputs().push_back(
 
 ---
 
+前面处理的是一个子图内部，以及它对外的输入输出边界。现在返回模型层：Signature 给子图边界命名，Metadata 附带模型信息，Dispatch 资产则把特定 Op 与已保存的后端程序关联。
+
 ## 6. 模型级元信息与 Dispatch Op
 
 ### 6.1 模型级信息
@@ -595,7 +601,7 @@ litert_subgraph.Outputs().push_back(
 
 其中部分对象先调用 FlatBuffers 生成的 `UnPack()`，再转为 LiteRT 的内部表示。不能把这些信息都概括为“简单读取，无额外处理”，例如 Signature 解包还包含索引与数量校验。
 
-原稿把 Signature 单列出来很有用，因为它和逐算子解包不一样：先核对目标子图及 I/O 数量，再用每项的 Tensor 编号处理别名，最后按子图 I/O 顺序组织列表。比如文件子图的输入是 `[T3,T7]`，具名记录先写 `rhs → T7`、再写 `lhs → T3`，整理后的名字顺序仍是 `[lhs,rhs]`。一个入口由 key 找到对应子图；参数名是入口的名字，既不是张量编号，也不是文件向量恰好出现的位置。对照无显式签名时的默认入口，见 [UnpackSignatures 与 fallback](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L518-L646)。
+Signature 解决的是「调用方用什么名字找到哪个子图的哪些张量」。先核对目标子图及 I/O 数量，再按 Tensor 编号处理别名，最后按子图 I/O 顺序组织列表。比如输入顺序是 `[T3,T7]`，具名记录先写 `rhs → T7`、再写 `lhs → T3`，整理后仍是 `[lhs,rhs]`。名字、Tensor 编号、具名记录在文件中的位置是三个概念。没有显式签名时，见 [UnpackSignatures 的默认入口](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/litert/core/model/model_load.cc#L518-L646)。
 
 #### 按子图顺序整理 Signature 的别名
 

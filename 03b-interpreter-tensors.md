@@ -4,6 +4,10 @@
 
 上一节已经建立 Tensor 槽位和图的输入、输出编号。这一篇接着看 `ParseTensors` 怎样把每份描述填到槽位里，并区分常量数据、可写张量和真正分配好的运行时缓冲区。
 
+跟一张 Tensor 时可以依次看三件事：**描述是什么**（类型、形状、量化），**数据从哪来**（模型常量还是运行时填入），**什么时候才能拿到地址**（导入时借用，或运行时另行分配）。这几个问题分别出现在 `ParseTensors()`、只读/读写分支和后续内存规划中。
+
+仍用 [ADD 的三个槽位](01-model-format.md#32-用一个-add-把索引走通)对照：T0/T1/T2 都引用空 Buffer 0，因此此时只能填入 float32 和形状等描述；只有把 Y 改成文件常量，T1 才改走下文的只读配置。
+
 ## 1. ParseTensors 怎样逐项处理
 
 先 `AddTensors` 建张量槽位并让 Context 能定位它们，再设图的输入、输出索引，最后逐个配置这些槽位。AddTensors 扩的是 `TfLiteTensor` 描述对象数组，不等于为所有张量的数据分配内存。Builder 把 schema 的 `TensorType` 映射到运行时 `TfLiteType`（例如 `INT32 → kTfLiteInt32`），并统计浮点张量，供后面的默认委托工厂判断。
@@ -28,7 +32,7 @@ TfLiteStatus InterpreterBuilder::ParseTensors(
   }
 ```
 
-以上为特殊情况的一些处理，如果telemetry不为空，这里会更新其中对应tensor量化的集合的大小，接下来的循环中会对所有的tensor一一进行构造
+若提供 telemetry，先为每张 Tensor 的量化信息预留记录位置。接下来才遍历文件中的 Tensor，逐项填入运行时槽位。
 
 ```cpp
   num_fp32_tensors_ = 0;
@@ -245,7 +249,7 @@ MultiAxis 用轴列表描述参数如何对应多维切片；比例和零点是�
 
 将multiaxis需要的参数配置到了TfliteQuantization对象中，最后保存为了void*指针
 
-接着处理blockwise量化的情况，blockwise的具体参数和内容可以参考模型加载部分的文档
+接下来是 Blockwise Quantization。沿用 [模型格式里的分块例子](01-model-format.md#42-blockwisequantization)：先问每组参数覆盖哪些元素，再看运行时怎么保存参数 Tensor 的编号。不要把编号当作已经读出的 scale 数值。
 
 ```cpp
   if (src_quantization->details_type() ==
@@ -376,7 +380,7 @@ blockshape参数的形状应该与tensor的shape的形状一致，每一个位�
   }
 ```
 
-如果事先开启了压缩量化zeropoints的功能，则会比较是否所有的zeropoint值都一样
+若启用了零点压缩，并且所有零点相等，可以只存一个零点。这省的是重复的量化元数据，不会改写权重数值或张量形状。
 
 ```cpp
   if (src_quantization->quantized_dimension() < 0 ||
@@ -474,7 +478,7 @@ shape_signature被用于说明tensor某一维是固定的或是不固定的，�
       }
 ```
 
-这里匹配了tensor具体对内存的使用方式，当buffer_ptr存在时即有固定的数据，则可变的tensor不可接受.对于稀疏tesnor来说，目前也仅接受有固定数据的情况，parseSparsity的细节如下：
+这一步按能否取得常量数据指针分流。已有固定字节的 Tensor 走只读配置，不能同时标为 variable；该版本的 sparsity 导入也只支持固定数据。下面的 `ParseSparsity()` 读的是压缩值对应的坐标描述。
 
 ```text
 读取可能存在的常量地址和大小
@@ -696,7 +700,7 @@ TfLiteStatus Subgraph::SetTensorParametersReadOnly(
 }
 ```
 
-将tensor index与buffer的对应关系保存到subgraph中，此处的bufferid指的是tflite中的buffers数组的索引
+子图在这里记录 Tensor 编号到文件级 `Model.buffers` 编号的映射。这个 `buffer_id` 不是上篇 LiteRT IR 的 `BufferManager` 句柄。
 
 ## 7. 读写 Tensor 的分配策略
 
@@ -726,7 +730,7 @@ TfLiteStatus Subgraph::SetTensorParametersReadOnly(
 }
 ```
 
-readwrite与readonly相比主要只有下面一段有明显区别，除此之外bufferid只有外部id以及没有对sparsity的处理
+读写分支没有内置常量地址，也不解析只读路径的 sparsity 元数据；调用它时传的是 `external_buffer` 编号。代码接着选择日后怎么分配，下面三类 Tensor 的区别主要在数据寿命。
 
 ```cpp
   TfLiteAllocationType allocation_type = kTfLiteArenaRw;
@@ -742,6 +746,6 @@ readwrite与readonly相比主要只有下面一段有明显区别，除此之外
   }
 ```
 
-这里决定了不同类型的tensor在runtime时会怎么选择内存生命周期策略，persistent代表了tensor的内存区域需要被保留不能被覆盖使用，具体留到arena相关得到部分
+`Persistent` 的重点是这块存储还要留给后续调用，不能按普通中间值处理。这时只是选定分配类型；地址如何落实，见 [Prepare 与内存分配](04b-interpreter-prepare.md#3-allocatetensors-暂停后invoke-怎样继续)。
 
-到此为止tensor的解析就已经结束了，进入node也就是operator的解析环节
+现在 Tensor 槽里已经有了数据描述和分配策略。接着读 [算子节点与 Signature](03c-interpreter-nodes.md)，看 `ParseNodes()` 怎样把这些槽接进执行计划。

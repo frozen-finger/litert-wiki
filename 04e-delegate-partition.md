@@ -68,6 +68,8 @@ TfLiteStatus Subgraph::ReplaceNodeSubsetsWithDelegateKernels(
 
 `PartitionGraph` 先根据数据与控制依赖把候选与非候选划分为分区，不修改执行计划。保留中间 Tensor、禁止融合或禁用聚类等配置会限制可合并范围，而不是只看节点是否相邻。
 
+把「候选」与「分区」分开读：候选表示后端说自己能运行这些节点，分区表示 Runtime 判定哪些能作为一个整体运行。例如可委托节点的输出先经过普通节点处理，再返回后续可委托节点，这两段就不能跨过普通节点合成一个整体。
+
 ## 2. 分区边界怎样从依赖关系算出来
 
 [PartitionGraph 的 epoch 逻辑](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/graph_info.cc#L90-L259)
@@ -254,19 +256,15 @@ bool Subgraph::IsFullyDelegated() const {
 
 </details>
 
-这里主要负责根据delegate对动态tensor的支持能力，重新准备tensor内存，并更新subgraph的状态，确保修改后的计算图正常，几种状态定义如下：
+这段收尾使用的是**改图前的状态**加上**本次 Delegate 的能力**。把状态和动作对起来：
 
-kStateUninvokable	当前图尚未准备好执行，需要重新 Prepare 或分配内存
-kStateInvokable	图已具备执行条件，仍允许后续进行相关调整
-kStateInvokableAndImmutable	图已准备好执行，并受到不可变状态约束，通常是应用不支持动态 Tensor 的 Delegate 后的状态
+| 现在的状态或条件 | 回到上面看哪一步 |
+| --- | --- |
+| `kStateUninvokable`：暂不可执行 | 还需 Prepare 或分配 |
+| `kStateInvokable`：可执行，尚可调整 | 若原图已可执行且新 Delegate 支持动态形状，刷新必要分配 |
+| `kStateInvokableAndImmutable`：可执行，受不可变约束 | 静态 Delegate 通常重新准备分配并锁定状态；整图提示走例外分支。如果在已锁定的图上再应用动态 Delegate，先 Prepare 检查；新图出现动态张量则移除 Delegate 并报错 |
 
-对应了三种情况：
-
-1. 当前 Delegate 不支持动态 Tensor	重新准备内存，然后将图标记为 Immutable
-2. 当前 Delegate 支持动态 Tensor，但之前的 Delegate 不支持	检查新 Delegate 是否引入动态 Tensor；若有则移除 Delegates 并报错
-3. 当前 Delegate 支持动态 Tensor，之前的图已经是 Invokable	调用 EnsureMemoryAllocations()，保持图的内存分配状态一致
-
-至此modify的流程基本结束了
+最后回到 [ADD 实验](05-reading-lab.md)：先走不启用默认 Delegate 的版本，再打开相应后端对照。两次应算出同样结果，但要看执行计划才能知道实际调用了谁。
 
 ## 源码导航
 

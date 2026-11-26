@@ -6,6 +6,8 @@
 
 文中的 C++ 按调用现场节选；长片段可展开。链接指向核对过的上游版本，片段不作为独立程序编译。
 
+先把这组三篇的交接记下来：**本篇建子图与张量槽位、确定 I/O 编号；下一篇填每个槽的描述；第三篇才把节点、张量索引和内核接起来。** 如果看到 `AddTensors()` 就以为已经能填模型输入，后面遇到空的数据指针便很难知道该查哪一步。
+
 ## 1. Builder 的构造与入口检查
 
 ```cpp
@@ -15,6 +17,8 @@ if (builder(&interpreter) != kTfLiteOk || !interpreter) {
   // ...
 }
 ```
+
+示例里的 `model` 来自已经打开的 FlatBuffer；`resolver` 则由调用方提供，例如默认的 `tflite::ops::builtin::BuiltinOpResolver`。[构造函数](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L220-L252)把它保存为 `op_resolver_`；创建 Builder 本身不会按节点查找或运行算子。真正的第一次查找在下文的 `BuildLocalIndexToRegistrationMapping()`。
 
 传给 `operator()` 的是一个用于接收结果的 `unique_ptr`，不是已经构造好的 Interpreter。Interpreter 并非不能直接构造；从模型建图时，把校验、子图导入和算子绑定交给 Builder。构建过程可概括为：
 
@@ -103,6 +107,8 @@ TfLiteStatus InterpreterBuilder::operator()(
 |---|---|---|
 | 内建 op | `FindOp(builtin_code, version)` | 该版本未注册，构建失败；只支持同名的其他版本不够 |
 | 自定义 op | `FindOp(custom_code, version)` | 名称存在但未注册时，可放入未解析占位项，留待 Delegate 或 Prepare；没有名称仍是错误 |
+
+举例：两条 Operator 都写 `opcode_index=0`，第 0 项描述 ABS 及模型要求的版本。Builder 对这项调用 `resolver.FindOp(BuiltinOperator_ABS, version)`，两个节点随后分别从本地表拿到同一份实现信息。**0 是文件表的位置，ABS 是算子类型，version 是实现查找条件**。[执行篇会沿同一个 ABS 展开](04-resolver-delegate.md#1-resolver-查找什么)，并追到实际回调。
 
 `GetBuiltinCode` 是读取 schema 里内建编号的兼容入口，不应假定历史模型只使用新版编号字段。`flatbuffer_op_index_to_registration_` 是按原表顺序保存的 `const TfLiteRegistration*` 数组；原始 registration 由 Resolver 提供，Builder 自己管理的 `unresolved_custom_ops_` 则存占位记录。实现先为可能的自定义项预留空间，再把指针放进索引表，避免向量扩容使旧地址失效。模型里未命名的 CUSTOM、超出范围的内建 opcode、未注册的 built-in 版本都不该被当作“等待 Delegate”的普通情况。
 
@@ -228,7 +234,7 @@ TfLiteStatus GetRegistrationFromOpCode(
 
 </details>
 
-GetRegistrationFromOpCode定义在op_resolver中，如果不为custom op则通过实现了op_resolver接口的对象的findop方法返回一个registration对象，如果是custom op则使用名称去resolver中查找有无对应的registration，在实际实践时，可能在interpreter构造前就已经通过resolver注册了一个自己实现的registration。关于resolver的具体实现放到resolver的章节之中
+`GetRegistrationFromOpCode()` 把文件里的 `OperatorCode` 转成一次 Resolver 查找：内建算子按编号和版本找，自定义算子按名称和版本找。调用方可以在构建前把自己的实现注册到 Resolver；在 [Resolver 一篇](04-resolver-delegate.md#1-resolver-查找什么)再看这两种表如何查找。
 
 找不到有名称的 CUSTOM 时，可先保存占位 Registration。这给后续 delegate 处理留下机会，不代表该算子已有 CPU 实现。`Flex` 前缀标识 Select TF Ops 路径，仍须有相应的 Flex Delegate。
 
@@ -272,7 +278,7 @@ Interpreter 初始化第 0 个 Subgraph；Builder 为序列化子图补齐运行
 
 对照：[Interpreter 创建和子图导入](https://github.com/google-ai-edge/LiteRT/blob/e3c11f0d0e7ec02ecb6fd4ee872d5ee569402f62/tflite/core/interpreter_builder.cc#L972-L1024)。
 
-这部分创建了临时的interpreter并通过addsubgraphs向interpreter中注册对应数量的subgraph，interpreter的构造函数如下：
+Builder 先建立临时 Interpreter。它自己创建主子图；`AddSubgraphs()` 再补齐其余槽位。看下面的构造函数时，先分清哪些 Context 由每个子图各自持有，哪些资源在 Interpreter 层共享。
 
 ```cpp
 Interpreter::Interpreter(ErrorReporter* error_reporter)
@@ -496,7 +502,7 @@ std::unique_ptr<tflite::Profiler> MaybeCreatePlatformProfiler() {
 
 </details>
 
-此处将model即flatbuffer中的subgraph信息导入到了之前创建的subgraph对象之中，如果telemetry不为空的情况下，subgraphinfo中会包含tensor对应的量化信息。
+接下来开始填前面创建的子图。先建张量槽和 I/O 列表，再导入 Tensor 与 Node；若开启 telemetry，子图记录还会保留相应张量的量化信息。I/O 列表在这里已可读，不需要等到内核 Prepare。
 
 ```cpp
 TfLiteStatus Subgraph::AddTensors(int tensors_to_add,
